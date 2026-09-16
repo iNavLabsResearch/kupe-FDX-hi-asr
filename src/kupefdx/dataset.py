@@ -60,12 +60,20 @@ class ManifestDataset(Dataset):
                 "context": r.get("context"),            # prior conversation turns
                 "domain": r.get("domain", "general")}
         if self.mode == "feats" and r.get("feats"):
-            item["feats"] = np.load(r["feats"]).astype(np.float32)
+            item["feats"] = _load_array(r["feats"], r.get("feats_key")).astype(np.float32)
         else:
             item["wave"] = load_wav(r["audio"]).astype(np.float32)
         if r.get("codes"):
-            item["codes"] = np.load(r["codes"]).astype(np.int64)
+            item["codes"] = _load_array(r["codes"], r.get("codes_key")).astype(np.int64)
         return item
+
+
+def _load_array(path: str, key: str | None = None) -> np.ndarray:
+    """Load a .npy, or one array from a packed .npz (key = clip id)."""
+    if key and (path.endswith(".npz") or path.endswith(".npz.npz")):
+        with np.load(path, allow_pickle=False) as z:
+            return z[key]
+    return np.load(path)
 
 
 def split_rows(rows):

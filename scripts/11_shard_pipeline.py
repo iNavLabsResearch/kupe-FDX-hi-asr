@@ -24,6 +24,8 @@ import hashlib
 import itertools
 import os
 import shutil
+import tempfile
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import torch
@@ -167,13 +169,15 @@ def main():
     ap.add_argument("--local-dir", default=None)
     ap.add_argument("--domain", default="general")
     ap.add_argument("--shard-size", type=int, default=500)
-    ap.add_argument("--encode-batch", type=int, default=16,
-                    help="GPU batch size for feature encode (4090: 16–32)")
+    ap.add_argument("--encode-batch", type=int, default=48,
+                    help="GPU batch size for feature encode (4090: 32–64)")
     ap.add_argument("--shard-start", type=int, default=0, help="process shards where idx%%stride==shard-start")
     ap.add_argument("--stride", type=int, default=1)
     ap.add_argument("--no-flush", action="store_true", help="keep local shard files (debug)")
     ap.add_argument("--raw-only", action="store_true",
                     help="download + push RAW audio only (skip the encoder); encode later")
+    ap.add_argument("--push-raw", action="store_true",
+                    help="also upload raw wavs (default: skip — source datasets stay on Hub)")
     ap.add_argument("--peek", action="store_true",
                     help="print one example's column names (find --audio-col/--text-col) and exit")
     a = ap.parse_args()
@@ -211,6 +215,41 @@ def main():
     src = (a.hf or a.hf_id or a.local_dir).replace("/", "_")
     total_h = led.total_meta("hours")
 
+    # Overlap Hub upload with next shard's GPU encode (1 worker keeps Hub ordered).
+    up_ex = ThreadPoolExecutor(max_workers=1)
+    up_fut = None
+    up_stage = None  # temp dir held until upload finishes
+
+    def _wait_upload():
+        nonlocal up_fut, up_stage
+        if up_fut is not None:
+            up_fut.result()
+            up_fut = None
+        if up_stage and os.path.isdir(up_stage):
+            shutil.rmtree(up_stage, ignore_errors=True)
+            up_stage = None
+
+    def _submit_upload(payload_dir, path_in_repo, msg, sid, n_clips, hours):
+        """Copy tiny payload aside, upload in background (overlaps next encode)."""
+        nonlocal up_fut, up_stage, total_h
+        _wait_upload()
+        stage = tempfile.mkdtemp(prefix="hubup_", dir=cfg.paths.data_dir)
+        dst = os.path.join(stage, "payload")
+        shutil.copytree(payload_dir, dst)
+        up_stage = stage
+
+        def _run():
+            nonlocal total_h
+            upload_folder(dst, cfg.repos.data, "dataset", path_in_repo=path_in_repo,
+                          commit_message=msg)
+            total_h += hours
+            led.mark(sid, "done", clips=n_clips, hours=hours)
+            led.push(f"shardpipe {sid} done ({total_h:.1f} h total)")
+            log.info("shard %s: Hub ok — %d clips, %.2f h | cumulative %.1f h",
+                     sid, n_clips, hours, total_h)
+
+        up_fut = up_ex.submit(_run)
+
     @torch.no_grad()
     def feats_batch(paths):
         """Encode a list of wav paths in GPU minibatches → list of [T,D] float32 arrays."""
@@ -247,55 +286,59 @@ def main():
         if not rows:
             continue
         work = os.path.join(cfg.paths.data_dir, "encoded", "shards", sid)
-        os.makedirs(work, exist_ok=True)
+        hub = os.path.join(work, "_hub")  # only the few files we push (not 2k npys)
+        os.makedirs(hub, exist_ok=True)
         try:
-            # 1) encode feats (+ fit quantizer on the very first shard if codes enabled)
+            # 1) encode → ONE packed feats.npz (Hub hates thousands of tiny .npy files)
             if not a.raw_only:
                 log.info("shard %s: encoding %d clips (batch=%d)...", sid, len(rows), a.encode_batch)
                 feats = feats_batch([r["audio"] for r in rows])
-                for r, f in zip(rows, feats):
-                    np.save(os.path.join(work, r["id"] + ".feats.npy"), f.astype(np.float16))
-                    r["feats"] = f"shards/{sid}/{r['id']}.feats.npy"
-            if not a.raw_only and n_codes > 0 and quant is None:
-                pool = np.concatenate([np.load(os.path.join(work, r["id"] + ".feats.npy")).astype(np.float32)
-                                       for r in rows[:64]], 0)
-                quant = KMeansQuantizer.fit(pool, n_codes, iters=25)
-                quant.save(qpath)
-                upload_file(qpath, cfg.repos.data, "dataset", "encoded/quantizer.pt", "quantizer")
-                log.info("fitted + pushed quantizer (%d codes)", n_codes)
-            if not a.raw_only and n_codes > 0:
+                # uncompressed one-file pack — Hub LFS loves 1 object; zip compress burns CPU
+                pack = {r["id"]: f.astype(np.float16) for r, f in zip(rows, feats)}
+                np.savez(os.path.join(hub, "feats.npz"), **pack)
                 for r in rows:
-                    f = np.load(os.path.join(work, r["id"] + ".feats.npy")).astype(np.float32)
-                    np.save(os.path.join(work, r["id"] + ".codes.npy"), quant.encode(f).astype(np.int64))
-                    r["codes"] = f"shards/{sid}/{r['id']}.codes.npy"
-            # 2) shard manifest
-            write_manifest(os.path.join(work, "manifest.jsonl"), rows)
-            # 3) push RAW (always) + ENCODED (unless raw-only) — ONE folder commit each (fast)
-            raw_stage = os.path.join(work, "raw")
-            os.makedirs(raw_stage, exist_ok=True)
-            for r in rows:
-                _stage(r["audio"], os.path.join(raw_stage, os.path.basename(r["audio"])))
-            log.info("shard %s: %d clips downloaded -> uploading raw...", sid, len(rows))
-            upload_folder(raw_stage, cfg.repos.data, "dataset", path_in_repo=f"raw/{sid}",
-                          commit_message=f"raw {sid}")
-            shutil.rmtree(raw_stage, ignore_errors=True)
+                    r["feats"] = f"encoded/{sid}/feats.npz"
+                    r["feats_key"] = r["id"]
+                if n_codes > 0 and quant is None:
+                    pool = np.concatenate([f.astype(np.float32) for f in feats[:64]], 0)
+                    quant = KMeansQuantizer.fit(pool, n_codes, iters=25)
+                    quant.save(qpath)
+                    upload_file(qpath, cfg.repos.data, "dataset", "encoded/quantizer.pt", "quantizer")
+                    log.info("fitted + pushed quantizer (%d codes)", n_codes)
+                if n_codes > 0:
+                    cpack = {r["id"]: quant.encode(f.astype(np.float32)).astype(np.int64)
+                             for r, f in zip(rows, feats)}
+                    np.savez(os.path.join(hub, "codes.npz"), **cpack)
+                    for r in rows:
+                        r["codes"] = f"encoded/{sid}/codes.npz"
+                        r["codes_key"] = r["id"]
+            # 2) shard manifest (tiny)
+            write_manifest(os.path.join(hub, "manifest.jsonl"), rows)
+            # 3) optional RAW (off by default — saves ~20–40s + 400MB/shard on GPU clock)
+            if a.raw_only or a.push_raw:
+                raw_stage = os.path.join(work, "raw")
+                os.makedirs(raw_stage, exist_ok=True)
+                for r in rows:
+                    _stage(r["audio"], os.path.join(raw_stage, os.path.basename(r["audio"])))
+                log.info("shard %s: %d clips -> uploading raw...", sid, len(rows))
+                upload_folder(raw_stage, cfg.repos.data, "dataset", path_in_repo=f"raw/{sid}",
+                              commit_message=f"raw {sid}")
+                shutil.rmtree(raw_stage, ignore_errors=True)
+            # 4) push 1–3 files; Hub upload overlaps next shard encode
             sub = "manifests" if a.raw_only else "encoded"
-            upload_folder(work, cfg.repos.data, "dataset", path_in_repo=f"{sub}/{sid}",
-                          commit_message=f"{sub} {sid}")
-            # 4) ledger + hours
             sh = sum(r["dur"] for r in rows) / 3600
-            total_h += sh
-            led.mark(sid, "done", clips=len(rows), hours=sh)
-            led.push(f"shardpipe {sid} done ({total_h:.1f} h total)")
-            log.info("shard %s: %d clips, %.2f h | cumulative %.1f h", sid, len(rows), sh, total_h)
+            log.info("shard %s: queuing Hub upload (%s, packed %.2f h)...", sid, sub, sh)
+            _submit_upload(hub, f"{sub}/{sid}", f"{sub} {sid}", sid, len(rows), sh)
         finally:
-            # 5) FLUSH local (raw + encoded) to keep disk light
+            # flush local wavs + work immediately; Hub copy lives in up_stage until done
             if not a.no_flush:
                 shutil.rmtree(work, ignore_errors=True)
                 for p in [r.get("audio") for r in rows]:
                     if p and os.path.isfile(p):
                         os.remove(p)
 
+    _wait_upload()
+    up_ex.shutdown(wait=False)
     log.info("DONE. total pushed: %.1f h | ledger: %s", total_h, led.counts())
 
 
