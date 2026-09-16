@@ -5,11 +5,11 @@
 # Continues on error so one bad source does not block the rest.
 # Column names are auto-detected by 11_shard_pipeline.py (no peek needed).
 #
-# Usage:
-#   bash scripts/gather_all.sh                         # full pipeline (default)
-#   RAW_ONLY=1 bash scripts/gather_all.sh              # download + push raw only
-#   SHARD_SIZE=500 CONFIG=configs/gpu.yaml bash scripts/gather_all.sh
-#   ONLY=fleurs_hi,shrutilipi_hi bash scripts/gather_all.sh   # subset by name
+# Usage (4090 + ~400GB disk — tuned defaults):
+#   bash scripts/gather_all.sh
+#   ONLY=shrutilipi_hi bash scripts/gather_all.sh          # skip fleurs (already done)
+#   RAW_ONLY=1 bash scripts/gather_all.sh                  # download + push raw only
+#   SHARD_SIZE=2000 ENCODE_BATCH=32 bash scripts/gather_all.sh
 #
 # Encoder: configs/gpu.yaml → facebook/omniASR-W2V-300M (Meta SSL). Needs
 #   pip install omnilingual-asr   OR the HF Wav2Vec2 mirror is used automatically.
@@ -19,19 +19,21 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 CONFIG="${CONFIG:-configs/gpu.yaml}"
-SHARD_SIZE="${SHARD_SIZE:-500}"
+# Bigger shards = fewer Hub commits (main wall-clock win). 2000 ≈ 3–4 h audio/shard.
+SHARD_SIZE="${SHARD_SIZE:-2000}"
+# GPU encode minibatch — 4090 handles 16–32 for ~10s clips at bf16.
+ENCODE_BATCH="${ENCODE_BATCH:-24}"
 RAW_ONLY="${RAW_ONLY:-0}"
 ONLY="${ONLY:-}"
 
-EXTRA=()
+EXTRA=(--encode-batch "$ENCODE_BATCH")
 if [[ "$RAW_ONLY" == "1" ]]; then
-  EXTRA+=(--raw-only)
+  EXTRA=(--raw-only)
 fi
 
 # name | hf_id | config | split | domain
 # OpenSLR-only packs (MUCS, Gramvaani) are not HF-streamable — drop those in via --local-dir.
-# Common Voice: HF mirrors are gated/empty since Mozilla moved to Data Collective — skip here;
-#   use --local-dir after manual download if needed.
+# Common Voice: HF mirrors are gated/empty since Mozilla moved to Data Collective — skip here.
 DATASETS=(
   "fleurs_hi|google/fleurs|hi_in|train|general"
   "shrutilipi_hi|ai4bharat/Shrutilipi|hindi|train|news"

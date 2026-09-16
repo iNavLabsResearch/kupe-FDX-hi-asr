@@ -167,6 +167,8 @@ def main():
     ap.add_argument("--local-dir", default=None)
     ap.add_argument("--domain", default="general")
     ap.add_argument("--shard-size", type=int, default=500)
+    ap.add_argument("--encode-batch", type=int, default=16,
+                    help="GPU batch size for feature encode (4090: 16–32)")
     ap.add_argument("--shard-start", type=int, default=0, help="process shards where idx%%stride==shard-start")
     ap.add_argument("--stride", type=int, default=1)
     ap.add_argument("--no-flush", action="store_true", help="keep local shard files (debug)")
@@ -196,7 +198,9 @@ def main():
     hf_login()
     ensure_repo(cfg.repos.data, "dataset")
 
-    enc = None if a.raw_only else build_encoder(cfg).to(dev).eval()
+    enc_dtype = torch.bfloat16 if (dev == "cuda" and str(getattr(cfg.base, "dtype", "")) == "bfloat16") \
+        else torch.float32
+    enc = None if a.raw_only else build_encoder(cfg, dtype=enc_dtype).to(dev).eval()
     n_codes = 0 if a.raw_only else int(getattr(cfg.audio, "n_codes", 0))
     qpath = os.path.join(cfg.paths.data_dir, "encoded", "quantizer.pt")
     os.makedirs(os.path.dirname(qpath), exist_ok=True)
@@ -208,15 +212,35 @@ def main():
     total_h = led.total_meta("hours")
 
     @torch.no_grad()
-    def feats_of(path):
-        w = load_wav(path)
-        f, fl = enc.features(torch.from_numpy(w)[None].to(dev), torch.tensor([len(w)], device=dev))
-        return f[0, : int(fl[0])].float().cpu().numpy()
+    def feats_batch(paths):
+        """Encode a list of wav paths in GPU minibatches → list of [T,D] float32 arrays."""
+        out, bs = [], max(1, int(a.encode_batch))
+        for i in range(0, len(paths), bs):
+            chunk = paths[i:i + bs]
+            wavs = [load_wav(p) for p in chunk]
+            lens = [len(w) for w in wavs]
+            maxlen = max(lens)
+            batch = np.zeros((len(wavs), maxlen), dtype=np.float32)
+            for j, w in enumerate(wavs):
+                batch[j, : lens[j]] = w
+            wave = torch.from_numpy(batch).to(dev)
+            wave_len = torch.tensor(lens, device=dev)
+            f, fl = enc.features(wave, wave_len)
+            for j in range(len(wavs)):
+                out.append(f[j, : int(fl[j])].float().cpu().numpy())
+        return out
+
+    def _stage(src, dst):
+        """Hardlink when possible (fast, no disk copy); else plain copy (no utime)."""
+        try:
+            os.link(src, dst)
+        except OSError:
+            shutil.copy(src, dst)
 
     for si, rows in shard_stream(a):
         if (si % a.stride) != a.shard_start:
             continue
-        sid = f"{src}_shard_{si:05d}"
+        sid = f"{src}_n{a.shard_size}_shard_{si:05d}"
         if led.is_done(sid):
             log.info("shard %s already done — skip", sid)
             continue
@@ -227,10 +251,11 @@ def main():
         try:
             # 1) encode feats (+ fit quantizer on the very first shard if codes enabled)
             if not a.raw_only:
-              for r in rows:
-                f = feats_of(r["audio"])
-                np.save(os.path.join(work, r["id"] + ".feats.npy"), f.astype(np.float16))
-                r["feats"] = f"shards/{sid}/{r['id']}.feats.npy"
+                log.info("shard %s: encoding %d clips (batch=%d)...", sid, len(rows), a.encode_batch)
+                feats = feats_batch([r["audio"] for r in rows])
+                for r, f in zip(rows, feats):
+                    np.save(os.path.join(work, r["id"] + ".feats.npy"), f.astype(np.float16))
+                    r["feats"] = f"shards/{sid}/{r['id']}.feats.npy"
             if not a.raw_only and n_codes > 0 and quant is None:
                 pool = np.concatenate([np.load(os.path.join(work, r["id"] + ".feats.npy")).astype(np.float32)
                                        for r in rows[:64]], 0)
@@ -249,7 +274,7 @@ def main():
             raw_stage = os.path.join(work, "raw")
             os.makedirs(raw_stage, exist_ok=True)
             for r in rows:
-                shutil.copy2(r["audio"], os.path.join(raw_stage, os.path.basename(r["audio"])))
+                _stage(r["audio"], os.path.join(raw_stage, os.path.basename(r["audio"])))
             log.info("shard %s: %d clips downloaded -> uploading raw...", sid, len(rows))
             upload_folder(raw_stage, cfg.repos.data, "dataset", path_in_repo=f"raw/{sid}",
                           commit_message=f"raw {sid}")
