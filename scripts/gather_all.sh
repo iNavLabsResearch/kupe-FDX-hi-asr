@@ -1,14 +1,11 @@
 #!/usr/bin/env bash
-# gather_all.sh — continuous download ‖ encode ‖ Hub push for every Hindi source.
+# gather_all.sh — continuous download ‖ encode ‖ Hub push (packed feats, no raw by default).
 #
-# Continues on error so one bad source does not block the rest.
+# Cost-tuned defaults for a 24GB 4090 (~$0.79/hr):
+#   ENCODE_BATCH=16  MAX_BATCH_SEC=48  PREFETCH=6  SHARD_SIZE=2000
+#   (OOM auto-splits; done shards skip disk write)
 #
-# Usage (4090 + ~400GB disk):
-#   bash scripts/gather_all.sh
 #   ONLY=shrutilipi_hi,indicvoices_hi,kathbath_hi bash scripts/gather_all.sh
-#   PREFETCH=12 ENCODE_BATCH=48 bash scripts/gather_all.sh
-#   RAW_ONLY=1 bash scripts/gather_all.sh
-#   PUSH_RAW=1 bash scripts/gather_all.sh
 #
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -16,14 +13,14 @@ cd "$ROOT"
 
 CONFIG="${CONFIG:-configs/gpu.yaml}"
 SHARD_SIZE="${SHARD_SIZE:-2000}"
-ENCODE_BATCH="${ENCODE_BATCH:-48}"
-# How many full shards may sit on disk waiting for the GPU (each ≈ 3–4 h / ~0.4GB wav).
-PREFETCH="${PREFETCH:-8}"
+ENCODE_BATCH="${ENCODE_BATCH:-16}"
+MAX_BATCH_SEC="${MAX_BATCH_SEC:-48}"
+PREFETCH="${PREFETCH:-6}"
 RAW_ONLY="${RAW_ONLY:-0}"
 PUSH_RAW="${PUSH_RAW:-0}"
 ONLY="${ONLY:-}"
 
-EXTRA=(--encode-batch "$ENCODE_BATCH" --prefetch "$PREFETCH")
+EXTRA=(--encode-batch "$ENCODE_BATCH" --max-batch-sec "$MAX_BATCH_SEC" --prefetch "$PREFETCH")
 if [[ "$RAW_ONLY" == "1" ]]; then
   EXTRA=(--raw-only --prefetch "$PREFETCH")
 elif [[ "$PUSH_RAW" == "1" ]]; then

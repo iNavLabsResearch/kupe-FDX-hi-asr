@@ -99,29 +99,30 @@ def download_worker(a, cfg, src_name, led, dl_q: Queue, dl_bar: tqdm, err_box: l
         raw_root = os.path.join(cfg.paths.raw_dir, "wavs", src_name)
         os.makedirs(raw_root, exist_ok=True)
 
-        def emit(si, rows):
+        def should_skip(si: int) -> bool:
             if (si % a.stride) != a.shard_start:
-                for r in rows:
-                    p = r.get("audio")
-                    if p and os.path.isfile(p):
-                        os.remove(p)
-                return
+                return True
+            return led.is_done(f"{src_name}_n{a.shard_size}_shard_{si:05d}")
+
+        def emit(si, rows):
             sid = f"{src_name}_n{a.shard_size}_shard_{si:05d}"
-            if led.is_done(sid):
+            if should_skip(si):
                 for r in rows:
                     p = r.get("audio")
                     if p and os.path.isfile(p):
                         os.remove(p)
-                dl_bar.set_postfix_str(f"skip {sid}")
+                dl_bar.set_postfix_str(f"skip {sid[-20:]}")
                 return
             hours = sum(r["dur"] for r in rows) / 3600
-            # block here when prefetch full — download pauses, encode catches up
             dl_q.put((si, sid, rows, hours))
             dl_bar.set_postfix(q=dl_q.qsize(), shard=si, kept_h=f"{hours:.1f}")
 
         if a.local_dir:
             wavs = sorted(glob.glob(os.path.join(a.local_dir, "*.wav")))
             for si, i in enumerate(range(0, len(wavs), a.shard_size)):
+                if should_skip(si):
+                    dl_bar.update(min(a.shard_size, len(wavs) - i))
+                    continue
                 rows = []
                 for wav in wavs[i:i + a.shard_size]:
                     dl_bar.update(1)
@@ -158,6 +159,8 @@ def download_worker(a, cfg, src_name, led, dl_q: Queue, dl_bar: tqdm, err_box: l
             acol, tcol = _detect_cols(first, acol, tcol)
             tqdm.write(f"columns: audio={acol} text={tcol}")
             rows, si, j = [], 0, 0
+            skip = should_skip(0)
+            n_kept = 0
             for ex in itertools.chain([first], it):
                 dl_bar.update(1)
                 j += 1
@@ -172,6 +175,15 @@ def download_worker(a, cfg, src_name, led, dl_q: Queue, dl_bar: tqdm, err_box: l
                 dur = len(arr) / SAMPLE_RATE
                 if not _keep(text, dur):
                     continue
+                # Done / non-owned shards: advance stream without writing disk or GPU work
+                if skip:
+                    n_kept += 1
+                    if n_kept >= a.shard_size:
+                        dl_bar.set_postfix_str(f"skip shard {si}")
+                        si += 1
+                        n_kept = 0
+                        skip = should_skip(si)
+                    continue
                 cid = f"{src_name}_{si:04d}_{j:06d}"
                 p = os.path.join(raw_root, cid + ".wav")
                 save_wav(p, arr)
@@ -180,7 +192,8 @@ def download_worker(a, cfg, src_name, led, dl_q: Queue, dl_bar: tqdm, err_box: l
                 if len(rows) >= a.shard_size:
                     emit(si, rows)
                     rows, si = [], si + 1
-            if rows:
+                    skip = should_skip(si)
+            if rows and not skip:
                 emit(si, rows)
     except Exception as e:
         err_box.append(e)
@@ -224,10 +237,12 @@ def main():
     ap.add_argument("--local-dir", default=None)
     ap.add_argument("--domain", default="general")
     ap.add_argument("--shard-size", type=int, default=2000)
-    ap.add_argument("--encode-batch", type=int, default=48,
-                    help="GPU batch size (4090: 32–64)")
-    ap.add_argument("--prefetch", type=int, default=8,
-                    help="max shards buffered on disk waiting for GPU (disk budget)")
+    ap.add_argument("--encode-batch", type=int, default=16,
+                    help="max clips per GPU forward (4090: 8–16; OOM auto-splits)")
+    ap.add_argument("--max-batch-sec", type=float, default=48.0,
+                    help="max padded audio-seconds per forward (B*max_dur); caps VRAM")
+    ap.add_argument("--prefetch", type=int, default=6,
+                    help="max shards buffered on disk waiting for GPU")
     ap.add_argument("--shard-start", type=int, default=0)
     ap.add_argument("--stride", type=int, default=1)
     ap.add_argument("--no-flush", action="store_true")
@@ -252,6 +267,9 @@ def main():
             log.info("   %-20s%s", k, extra)
         return
 
+    import logging
+    logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
+
     dev = device_auto()
     hf_login()
     ensure_repo(cfg.repos.data, "dataset")
@@ -274,7 +292,6 @@ def main():
     up_q: Queue = Queue(maxsize=max(2, a.prefetch))
     err_box: list = []
 
-    # two stacked bars: download = HF examples seen; encode = clips GPU-done
     dl_bar = tqdm(total=total, unit="ex", desc="download", position=0,
                   dynamic_ncols=True, file=sys.stderr, leave=True, smoothing=0.05)
     enc_bar = tqdm(total=None, unit="clip", desc="encode  ", position=1,
@@ -293,23 +310,64 @@ def main():
     t_dl.start()
     t_up.start()
 
+    max_batch_samples = int(float(a.max_batch_sec) * SAMPLE_RATE)
+    max_clips = max(1, int(a.encode_batch))
+
     @torch.no_grad()
-    def feats_batch(paths):
-        out, bs = [], max(1, int(a.encode_batch))
-        for i in range(0, len(paths), bs):
-            chunk = paths[i:i + bs]
-            wavs = [load_wav(p) for p in chunk]
-            lens = [len(w) for w in wavs]
-            maxlen = max(lens)
-            batch = np.zeros((len(wavs), maxlen), dtype=np.float32)
-            for j, w in enumerate(wavs):
-                batch[j, : lens[j]] = w
-            wave = torch.from_numpy(batch).to(dev)
-            wave_len = torch.tensor(lens, device=dev)
-            f, fl = enc.features(wave, wave_len)
-            for j in range(len(wavs)):
-                out.append(f[j, : int(fl[j])].float().cpu().numpy())
+    def _forward_once(wavs):
+        lens = [len(w) for w in wavs]
+        maxlen = max(lens)
+        batch = np.zeros((len(wavs), maxlen), dtype=np.float32)
+        for j, w in enumerate(wavs):
+            batch[j, : lens[j]] = w
+        wave = torch.from_numpy(batch).to(dev, non_blocking=True)
+        wave_len = torch.tensor(lens, device=dev)
+        f, fl = enc.features(wave, wave_len)
+        out = [f[j, : int(fl[j])].float().cpu().numpy() for j in range(len(wavs))]
+        del wave, wave_len, f, fl, batch
         return out
+
+    def _forward_safe(wavs):
+        try:
+            return _forward_once(wavs)
+        except torch.cuda.OutOfMemoryError:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            if len(wavs) == 1:
+                raise
+            mid = max(1, len(wavs) // 2)
+            tqdm.write(f"OOM at batch={len(wavs)} — split → {mid}+{len(wavs) - mid}")
+            return _forward_safe(wavs[:mid]) + _forward_safe(wavs[mid:])
+
+    @torch.no_grad()
+    def feats_batch(rows):
+        """Length-sorted packing + OOM auto-split — cost-effective on 24GB."""
+        items = [(r["audio"], float(r["dur"])) for r in rows]
+        items.sort(key=lambda x: x[1])
+        out_by_path = {}
+        i = 0
+        while i < len(items):
+            chunk_paths, chunk_wavs = [], []
+            max_len = 0
+            while i < len(items) and len(chunk_paths) < max_clips:
+                path, dur = items[i]
+                L = max(1, int(dur * SAMPLE_RATE))
+                new_max = max(max_len, L)
+                if chunk_paths and (len(chunk_paths) + 1) * new_max > max_batch_samples:
+                    break
+                w = load_wav(path)
+                chunk_paths.append(path)
+                chunk_wavs.append(w)
+                max_len = max(max_len, len(w))
+                i += 1
+            if not chunk_wavs:
+                path, _ = items[i]
+                chunk_paths, chunk_wavs = [path], [load_wav(path)]
+                i += 1
+            for p, f in zip(chunk_paths, _forward_safe(chunk_wavs)):
+                out_by_path[p] = f
+            del chunk_wavs
+        return [out_by_path[r["audio"]] for r in rows]
 
     try:
         while True:
@@ -327,7 +385,7 @@ def main():
             os.makedirs(hub, exist_ok=True)
             try:
                 if not a.raw_only:
-                    feats = feats_batch([r["audio"] for r in rows])
+                    feats = feats_batch(rows)
                     pack = {r["id"]: f.astype(np.float16) for r, f in zip(rows, feats)}
                     np.savez(os.path.join(hub, "feats.npz"), **pack)
                     for r in rows:
@@ -347,6 +405,9 @@ def main():
                         for r in rows:
                             r["codes"] = f"encoded/{sid}/codes.npz"
                             r["codes_key"] = r["id"]
+                    del feats, pack
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
 
                 write_manifest(os.path.join(hub, "manifest.jsonl"), rows)
 
@@ -359,7 +420,6 @@ def main():
                                   path_in_repo=f"raw/{sid}", commit_message=f"raw {sid}")
                     shutil.rmtree(raw_stage, ignore_errors=True)
 
-                # durable staging for background upload (survive work/ flush)
                 stage = tempfile.mkdtemp(prefix="hubup_", dir=cfg.paths.data_dir)
                 payload = os.path.join(stage, "payload")
                 shutil.copytree(hub, payload)
