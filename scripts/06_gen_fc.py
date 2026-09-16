@@ -59,6 +59,11 @@ def main():
     ap.add_argument("--clips-per-hit", type=int, default=5)
     ap.add_argument("--concurrency", type=int, default=10)
     ap.add_argument("--push", action="store_true")
+    # floor-control needs CONVERSATIONAL clips; lecture monologues (NPTEL) teach bad turn-taking.
+    ap.add_argument("--exclude-domains", default="indian_english,read_us",
+                    help="comma domains to skip for FC gen (default skips lectures + read speech)")
+    ap.add_argument("--include-domains", default="",
+                    help="comma domains to KEEP (overrides exclude); e.g. spontaneous,accented")
     a = ap.parse_args()
     cfg = load_config(a.config)
 
@@ -72,6 +77,18 @@ def main():
         log.info("  %-20s %4.1f%%  %s", name, pct, desc)
 
     src_rows = read_manifest(a.src)
+    # keep only conversational clips for floor-control (exclude monotonous lectures/read speech)
+    inc = {d.strip() for d in a.include_domains.split(",") if d.strip()}
+    exc = {d.strip() for d in a.exclude_domains.split(",") if d.strip()}
+    n0 = len(src_rows)
+    if inc:
+        src_rows = [r for r in src_rows if r.get("domain") in inc]
+    else:
+        src_rows = [r for r in src_rows if r.get("domain") not in exc]
+    log.info("FC source filter: %d -> %d clips (include=%s exclude=%s)",
+             n0, len(src_rows), inc or "-", exc or "-")
+    if not src_rows:
+        raise SystemExit("no conversational clips left after domain filter — check --include/--exclude-domains")
     clips = build_clips(src_rows, a.limit)
     log.info("probed %d clips from %s", len(clips), a.src)
 
