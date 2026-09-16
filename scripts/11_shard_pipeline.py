@@ -138,10 +138,26 @@ def main():
     ap.add_argument("--no-flush", action="store_true", help="keep local shard files (debug)")
     ap.add_argument("--raw-only", action="store_true",
                     help="download + push RAW audio only (skip the encoder); encode later")
+    ap.add_argument("--peek", action="store_true",
+                    help="print one example's column names (find --audio-col/--text-col) and exit")
     a = ap.parse_args()
     cfg = a_cfg = load_config(a.config)
     if not a.hf and not a.hf_id and not a.local_dir:
         raise SystemExit("give --hf or --local-dir")
+
+    if a.peek:
+        from datasets import load_dataset
+        hf_login()
+        ds_id = a.hf_id or SOURCES[a.hf][0]
+        cfg_name = a.hf_config if a.hf_id else (SOURCES[a.hf][1] if a.hf else None)
+        ds = load_dataset(ds_id, cfg_name, split=a.split, streaming=True)
+        ex = next(iter(ds))
+        log.info("COLUMNS for %s/%s:", ds_id, cfg_name)
+        for k, v in ex.items():
+            extra = f" -> keys {list(v.keys())}" if isinstance(v, dict) else f" ({type(v).__name__})"
+            log.info("   %-20s%s", k, extra)
+        log.info("use --audio-col <the audio key> --text-col <the text key>")
+        return
     dev = device_auto()
     hf_login()
     ensure_repo(cfg.repos.data, "dataset")
