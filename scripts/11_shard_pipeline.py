@@ -81,16 +81,23 @@ def shard_stream(a):
             ds = load_dataset(ds_id, cfg_name, split=split, streaming=True, trust_remote_code=True)
         except TypeError:
             ds = load_dataset(ds_id, cfg_name, split=split, streaming=True)
+        from tqdm import tqdm
+        try:                                       # total clips for the bar (done/left/ETA)
+            from datasets import load_dataset_builder
+            total = load_dataset_builder(ds_id, cfg_name).info.splits[split].num_examples
+        except Exception:
+            total = None
         log.info("streaming %s (first shard downloads the archive — hold on)...", a.hf)
-        rows, si, j = [], 0, 0
-        for ex in ds:                              # incremental: save + log each clip as it arrives
+        bar = tqdm(total=total, unit="clip", desc=f"{a.hf}", dynamic_ncols=True)
+        rows, si, j, kept_h = [], 0, 0, 0.0
+        for ex in ds:                              # incremental: save each clip as it arrives
+            bar.update(1); j += 1
             text = normalize(ex[tcol])
             arr = np.asarray(ex[acol]["array"], dtype="float32")
             sr = ex[acol]["sampling_rate"]
             if sr != SAMPLE_RATE:
                 arr = _resample(arr, sr, SAMPLE_RATE)
             dur = len(arr) / SAMPLE_RATE
-            j += 1
             if not _keep(text, dur):
                 continue
             cid = f"{a.hf}_{si:04d}_{j:06d}"
@@ -98,13 +105,14 @@ def shard_stream(a):
             save_wav(p, arr)
             rows.append({"id": cid, "audio": p, "text": text, "dur": dur,
                          "domain": a.domain, "split": _split_of(cid)})
-            if len(rows) % 25 == 0:
-                log.info("  ...collected %d clips for shard %d", len(rows), si)
+            kept_h += dur / 3600
+            bar.set_postfix(shard=si, in_shard=len(rows), kept_h=f"{kept_h:.1f}")
             if len(rows) >= a.shard_size:
                 yield si, rows
                 rows, si = [], si + 1
         if rows:
             yield si, rows
+        bar.close()
 
 
 def main():
