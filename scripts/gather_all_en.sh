@@ -1,37 +1,43 @@
 #!/usr/bin/env bash
 # One-shot ENGLISH data pipeline: download -> encode -> push -> flush, for ALL sources.
-# Resumable (per-shard ledger) and continue-on-error (a gated/failed source won't stop the rest).
+# Diversified pretraining mix (~4,000+ h) incl. ~1,000 h Indian-English (AI4Bharat NPTEL).
+# Resumable per shard; continue-on-error (a gated/failed source won't stop the rest).
 #
-#   RAW_ONLY=1  (default) : gather raw audio only (fast, no encoder). Do this first.
-#   RAW_ONLY=0            : also encode features+codes (needs FastConformer/NeMo working).
-#   CFG=configs/en.yaml SHARD=500 bash scripts/gather_all_en.sh
+#   RAW_ONLY=1 (default): raw audio only (fast, no encoder). RAW_ONLY=0: also encode.
+#   NO_FLUSH=1          : keep raw+encoded on local disk (single-box training).
+#   CFG=configs/en.yaml SHARD=500 RAW_ONLY=0 NO_FLUSH=1 bash scripts/gather_all_en.sh
 set -uo pipefail
 cd "$(dirname "$0")/.."
 CFG=${CFG:-configs/en.yaml}
 SHARD=${SHARD:-500}
 RAW_ONLY=${RAW_ONLY:-1}
-NO_FLUSH=${NO_FLUSH:-0}          # 1 = keep raw+encoded on local disk (single-box training)
+NO_FLUSH=${NO_FLUSH:-0}
 EXTRA=""
 [ "$RAW_ONLY" = "1" ] && EXTRA="$EXTRA --raw-only"
 [ "$NO_FLUSH" = "1" ] && EXTRA="$EXTRA --no-flush"
 
-# id | config | split | domain     (columns auto-detected; --split matters for LibriSpeech)
+# id | config | split | domain | max_hours   (config "-" = none; max_hours 0 = all)
+# Diversify accents/styles: US read, spontaneous, podcasts/audiobooks, crowd accents,
+# and INDIAN-English lectures. Total pretraining ~4,000+ h.
 DATASETS=(
-  "openslr/librispeech_asr|clean|train.clean.100|read"
-  "openslr/librispeech_asr|clean|train.clean.360|read"
-  "openslr/librispeech_asr|other|train.other.500|read"
-  "mozilla-foundation/common_voice_17_0|en|train|accented"   # accept license first if gated
+  "openslr/librispeech_asr|clean|train.clean.100|read_us|0"          # ~100 h
+  "openslr/librispeech_asr|clean|train.clean.360|read_us|0"          # ~360 h
+  "openslr/librispeech_asr|other|train.other.500|read_us|0"          # ~500 h
+  "ai4bharat/NPTEL|-|train|indian_english|1000"                      # ~1000 h INDIAN English
+  "MLCommons/peoples_speech|clean|train|spontaneous|1000"           # ~1000 h spontaneous
+  "speechcolab/gigaspeech|l|train|podcasts_audiobooks|1000"          # ~1000 h (gated: accept)
+  "mozilla-foundation/common_voice_17_0|en|train|accented|500"       # ~500 h crowd accents (gated)
 )
-# Big optional corpora (uncomment for volume; large downloads — you have 400GB):
-# DATASETS+=("MLCommons/peoples_speech|clean|train|spontaneous")   # ~30k h
-# DATASETS+=("speechcolab/gigaspeech|l|train|mixed")               # gated
+# NOTE: ai4bharat/Svarah (9.6 h Indian-English) is an EVAL benchmark — do NOT train on it;
+#       use it as a held-out Indian-accent test set for scripts/04_eval.py.
 
 for entry in "${DATASETS[@]}"; do
-  IFS='|' read -r ID CFGNAME SPLIT DOMAIN <<< "$entry"
-  echo "════════ $ID  [$CFGNAME / $SPLIT]  domain=$DOMAIN ════════"
+  IFS='|' read -r ID CFGNAME SPLIT DOMAIN MAXH <<< "$entry"
+  echo "════════ $ID  [$CFGNAME / $SPLIT]  domain=$DOMAIN  max=${MAXH}h ════════"
+  CFGFLAG=(--hf-config "$CFGNAME"); [ "$CFGNAME" = "-" ] && CFGFLAG=()
   python scripts/11_shard_pipeline.py --config "$CFG" \
-      --hf-id "$ID" --hf-config "$CFGNAME" --split "$SPLIT" \
-      --domain "$DOMAIN" --shard-size "$SHARD" $EXTRA \
+      --hf-id "$ID" "${CFGFLAG[@]}" --split "$SPLIT" \
+      --domain "$DOMAIN" --shard-size "$SHARD" --max-hours "$MAXH" $EXTRA \
     || echo "!! $ID failed (gated/license/column) — continuing to next source"
 done
 

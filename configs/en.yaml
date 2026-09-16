@@ -43,7 +43,7 @@ model:
 data:
   manifest: data/manifests/train.jsonl
   max_dur: 30.0
-  min_hours: 500         # refuse the main run on too little data
+  min_hours: 2000        # main run needs a real corpus (we target ~4,000+ h pretraining)
   use_cached_feats: true
 
 train:

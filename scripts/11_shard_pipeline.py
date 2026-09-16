@@ -243,7 +243,7 @@ def download_worker(a, cfg, src_name, led, dl_q: Queue, dl_bar: tqdm, err_box: l
         acol, tcol = _detect_cols(first, acol, tcol)
         tqdm.write(f"columns: audio={acol} text={tcol}")
 
-        rows, si, j, n_kept = [], 0, 0, 0
+        rows, si, j, n_kept, kept_h = [], 0, 0, 0, 0.0
         skip = should_skip(0)
         for ex in itertools.chain([first], it):
             j += 1
@@ -292,10 +292,18 @@ def download_worker(a, cfg, src_name, led, dl_q: Queue, dl_bar: tqdm, err_box: l
             save_wav(p, arr)
             rows.append({"id": cid, "audio": p, "text": text, "dur": dur,
                          "domain": a.domain, "split": _split_of(cid)})
+            kept_h += dur / 3600.0
             if len(rows) >= a.shard_size:
                 emit(si, rows, j)
                 rows, si = [], si + 1
                 skip = should_skip(si)
+            if a.max_hours and kept_h >= a.max_hours:   # per-source cap
+                if rows:
+                    emit(si, rows, j)
+                    rows = []
+                tqdm.write(f"reached --max-hours {a.max_hours} for {src_name} "
+                           f"({kept_h:.1f} h) — stopping this source")
+                break
         if rows and not skip:
             emit(si, rows, j)
     except Exception as e:
@@ -388,6 +396,7 @@ def main():
     ap.add_argument("--local-dir", default=None)
     ap.add_argument("--domain", default="general")
     ap.add_argument("--shard-size", type=int, default=2000)
+    ap.add_argument("--max-hours", type=float, default=0.0, help="cap hours from this source (0=all)")
     ap.add_argument("--encode-batch", type=int, default=16)
     ap.add_argument("--max-batch-sec", type=float, default=48.0)
     ap.add_argument("--prefetch", type=int, default=6)
