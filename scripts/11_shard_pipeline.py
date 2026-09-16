@@ -215,12 +215,21 @@ def download_worker(a, cfg, src_name, led, dl_q: Queue, dl_bar: tqdm, err_box: l
         except TypeError:
             ds = load_dataset(ds_id, cfg_name, split=split, streaming=True)
 
-        # Jump past done prefix using stored end_j when available
+        # Jump past done prefix using stored end_j when available.
+        # Hub-synced shards often lack end_j — use shard_size * n as a safe lower bound
+        # (never overshoots; remainder is light-skipped without audio decode).
         skip_until_j = 0
         if first_todo_si > 0:
             prev = _sid(src_name, a.shard_size, first_todo_si - 1)
-            skip_until_j = int(led.d.get("meta", {}).get(prev, {}).get("end_j") or 0)
-            if skip_until_j:
+            meta = led.d.get("meta", {}).get(prev, {})
+            if not meta:
+                meta = led.d.get("meta", {}).get(f"{src_name}_shard_{first_todo_si - 1:05d}", {})
+            skip_until_j = int(meta.get("end_j") or 0)
+            if not skip_until_j:
+                skip_until_j = first_todo_si * a.shard_size
+                tqdm.write(f"approx fast-forward to j>{skip_until_j} "
+                           f"(hub-synced; light-skip any remainder of done 0..{first_todo_si - 1})")
+            else:
                 tqdm.write(f"fast-forward stream to j>{skip_until_j} "
                            f"(skip re-download of done shards 0..{first_todo_si - 1})")
 
@@ -300,17 +309,17 @@ def upload_worker(up_q: Queue, cfg, led, total_h_box: list, enc_bar: tqdm,
                   upload_every: int):
     """Batch several shards into ONE Hub commit; retry 429; never kill encode."""
     batch = []  # list of (payload_parent, sid, n_clips, hours, end_j)
-    batch_root = None
+    # After moving payloads into a tree, keep (tree, sids) until Hub accepts —
+    # so a failed flush can be retried without dropping work.
+    pending = None  # (tree_path, [(sid, n_clips, hours, end_j), ...])
 
     def flush():
-        nonlocal batch, batch_root
-        if not batch:
-            return
-        # Build a single tree: encoded/<sid>/{feats.npz,manifest.jsonl}
-        tree = tempfile.mkdtemp(prefix="hubbatch_", dir=cfg.paths.data_dir)
-        sids = []
-        keep_tree = False
-        try:
+        nonlocal batch, pending
+        if pending is None:
+            if not batch:
+                return
+            tree = tempfile.mkdtemp(prefix="hubbatch_", dir=cfg.paths.data_dir)
+            sids = []
             for parent, sid, n_clips, hours, end_j in batch:
                 payload = os.path.join(parent, "payload")
                 dst = os.path.join(tree, "encoded", sid)
@@ -318,37 +327,36 @@ def upload_worker(up_q: Queue, cfg, led, total_h_box: list, enc_bar: tqdm,
                 shutil.move(payload, dst)
                 sids.append((sid, n_clips, hours, end_j))
                 shutil.rmtree(parent, ignore_errors=True)
-            msg = f"encoded {sids[0][0]}..{sids[-1][0]} ({len(sids)} shards)"
-            _upload_retry(tree, cfg.repos.data, "", msg)
-            for sid, n_clips, hours, end_j in sids:
-                total_h_box[0] += hours
-                meta = {"clips": n_clips, "hours": hours}
-                if end_j:
-                    meta["end_j"] = end_j
-                led.mark(sid, "done", **meta)
-            led.save()
-            enc_bar.set_postfix(hub_q=up_q.qsize(), pushed_h=f"{total_h_box[0]:.1f}",
-                                batch=len(sids))
-            tqdm.write(f"Hub ok: {len(sids)} shards in 1 commit | "
-                       f"cumulative {total_h_box[0]:.1f} h")
-        except Exception as e:
-            keep_tree = True
-            tqdm.write(f"UPLOAD ERROR — payloads kept at {tree}: {e}")
-            raise
-        finally:
-            if not keep_tree:
-                shutil.rmtree(tree, ignore_errors=True)
             batch = []
+            pending = (tree, sids)
+
+        tree, sids = pending
+        msg = f"encoded {sids[0][0]}..{sids[-1][0]} ({len(sids)} shards)"
+        _upload_retry(tree, cfg.repos.data, "", msg)
+        for sid, n_clips, hours, end_j in sids:
+            total_h_box[0] += hours
+            meta = {"clips": n_clips, "hours": hours}
+            if end_j:
+                meta["end_j"] = end_j
+            led.mark(sid, "done", **meta)
+        led.save()
+        enc_bar.set_postfix(hub_q=up_q.qsize(), pushed_h=f"{total_h_box[0]:.1f}",
+                            batch=len(sids))
+        tqdm.write(f"Hub ok: {len(sids)} shards in 1 commit | "
+                   f"cumulative {total_h_box[0]:.1f} h")
+        shutil.rmtree(tree, ignore_errors=True)
+        pending = None
 
     try:
         while True:
             item = up_q.get()
             if item is SENTINEL:
-                try:
-                    flush()
-                except Exception:
-                    pass
-                # one ledger push at the very end
+                while pending is not None or batch:
+                    try:
+                        flush()
+                    except Exception as e:
+                        tqdm.write(f"final flush retry in 60s: {e}")
+                        time.sleep(60)
                 try:
                     led.push(f"shardpipe checkpoint {total_h_box[0]:.1f}h")
                 except Exception:
@@ -356,22 +364,14 @@ def upload_worker(up_q: Queue, cfg, led, total_h_box: list, enc_bar: tqdm,
                 break
             parent, sid, n_clips, hours, end_j = item
             batch.append((parent, sid, n_clips, hours, end_j))
-            if len(batch) >= max(1, upload_every):
+            # Retry pending first; only open a new batch commit when full.
+            while pending is not None or len(batch) >= max(1, upload_every):
                 try:
                     flush()
                 except Exception as e:
-                    # On persistent non-429 failure, re-raise after logging
-                    if "429" not in str(e).lower() and "rate limit" not in str(e).lower():
-                        tqdm.write(f"upload batch failed: {e}")
-                    # 429 already retried inside _upload_retry forever; other errors:
-                    # put back? for now sleep and retry flush once more
-                    time.sleep(30)
-                    try:
-                        flush()
-                    except Exception:
-                        tqdm.write("upload still failing — encode continues; "
-                                   "re-run later to push remaining")
-                        batch = []  # avoid infinite loop on poison
+                    tqdm.write(f"upload batch deferred (encode continues): {e}")
+                    time.sleep(60)
+                    break
     except Exception as e:
         tqdm.write(f"upload worker exit: {e}")
 
