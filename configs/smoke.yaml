@@ -18,7 +18,7 @@ paths:
   raw_dir: data/raw
 
 base:
-  encoder_id: facebook/omniASR_W2V_300M
+  encoder_id: facebook/omniASR-W2V-300M
   decoder_id: FrontiersMind/Nandi-Mini-150M
   trust_remote_code: true
   attn_impl: eager

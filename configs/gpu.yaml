@@ -19,12 +19,14 @@ paths:
 
 base:
   # ENCODER = Omnilingual SSL wav2vec2 (self-supervised weights ONLY).
-  # IMPORTANT: use the raw SSL checkpoint (omniASR_W2V_*), NOT the CTC-finetuned one
+  # IMPORTANT: use the raw SSL checkpoint (omniASR-W2V-*), NOT the CTC-finetuned one
   # (omniASR-CTC-*). We attach and TRAIN OUR OWN CTC head — none of Meta's CTC/decoder
   # weights are loaded. The SSL encoder has no output vocabulary baked in, so there is
   # no tokenizer mismatch.
+  # Hub id (hyphens): https://huggingface.co/facebook/omniASR-W2V-300M
+  # fairseq2 card name uses underscores: omniASR_W2V_300M
   encoder_type: omni_w2v                     # omni_w2v | fastconformer | indicconformer
-  encoder_id: facebook/omniASR_W2V_300M      # the SSL (W2V) checkpoint — confirm exact id (PLAN §9.1)
+  encoder_id: facebook/omniASR-W2V-300M      # SSL (W2V) — loaded via fairseq2 or HF mirror
   # Fallback if Hindi WER stalls (measured 2026 benchmarks favour it — ENCODER_DECISION.md):
   #   encoder_type: fastconformer ; encoder_id: ai4bharat/indic-conformer-600m-multilingual
   decoder_id: FrontiersMind/Nandi-Mini-150M

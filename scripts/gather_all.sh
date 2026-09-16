@@ -11,6 +11,9 @@
 #   SHARD_SIZE=500 CONFIG=configs/gpu.yaml bash scripts/gather_all.sh
 #   ONLY=fleurs_hi,shrutilipi_hi bash scripts/gather_all.sh   # subset by name
 #
+# Encoder: configs/gpu.yaml → facebook/omniASR-W2V-300M (Meta SSL). Needs
+#   pip install omnilingual-asr   OR the HF Wav2Vec2 mirror is used automatically.
+#
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
@@ -27,9 +30,10 @@ fi
 
 # name | hf_id | config | split | domain
 # OpenSLR-only packs (MUCS, Gramvaani) are not HF-streamable — drop those in via --local-dir.
+# CV 17 is gated / often empty without accepting terms — use 16_1 (also gated; accept on HF).
 DATASETS=(
   "fleurs_hi|google/fleurs|hi_in|train|general"
-  "common_voice_hi|mozilla-foundation/common_voice_17_0|hi|train|general"
+  "common_voice_hi|mozilla-foundation/common_voice_16_1|hi|train|general"
   "shrutilipi_hi|ai4bharat/Shrutilipi|hindi|train|news"
   "indicvoices_hi|ai4bharat/IndicVoices|hindi|train|spontaneous"
   "kathbath_hi|ai4bharat/Kathbath|hindi|train|read"

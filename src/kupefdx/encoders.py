@@ -98,13 +98,35 @@ class TinyEncoder(nn.Module):
         return x, self._flen(wave_len)
 
 
+def _omni_card(model_id: str) -> str:
+    """Normalize Hub/path id → fairseq2 card name (underscores).
+
+    facebook/omniASR-W2V-300M  →  omniASR_W2V_300M
+    omniASR_W2V_300M           →  omniASR_W2V_300M
+    aadel4/omniASR-W2V-300M    →  omniASR_W2V_300M
+    """
+    return model_id.split("/")[-1].replace("-", "_")
+
+
+def _omni_hf_mirror(card: str) -> str | None:
+    """Transformers-ready Wav2Vec2 mirrors of Meta's fairseq2 SSL checkpoints.
+    Official facebook/omniASR-W2V-* repos are fairseq2 assets (no config.json for
+    AutoModel) — use these for the HF path. Parity-verified vs Meta weights."""
+    return {
+        "omniASR_W2V_300M": "aadel4/omniASR-W2V-300M",
+        "omniASR_W2V_1B": "aadel4/omniASR-W2V-1B",
+    }.get(card)
+
+
 class OmniW2VEncoder(nn.Module):
     """Real omniASR_W2V SSL backbone wrapper. Loads the raw self-supervised encoder
     (no baked-in vocab) and applies the SAME block-causal mask for streaming.
 
-    The exact package/id is confirmed on the GPU box (PLAN §9 item 1). We try, in
-    order: (1) the omnilingual-asr package, (2) a HF Wav2Vec2Model with the given id.
-    Whichever loads, `.features` returns [B,T,D] + lengths and reports out_dim/rate."""
+    Load order:
+      1) fairseq2 card via omnilingual-asr  (e.g. omniASR_W2V_300M)
+      2) HF Wav2Vec2Model mirror             (aadel4/omniASR-W2V-300M)
+    Official Hub id: https://huggingface.co/facebook/omniASR-W2V-300M
+    """
 
     def __init__(self, model, out_dim: int, frame_rate: float, hop_samples: int,
                  chunk_frames: int, left_chunks: int, kind: str):
@@ -119,33 +141,82 @@ class OmniW2VEncoder(nn.Module):
 
     @classmethod
     def load(cls, model_id: str, chunk_frames: int, left_chunks: int, dtype=torch.float32):
-        # SSL ONLY: `model_id` must be the raw self-supervised wav2vec2 checkpoint
-        # (omniASR_W2V_*), NEVER the CTC-finetuned one (omniASR-CTC-*). We load only the
-        # encoder body; Meta's CTC/decoder head weights are not used. Our own CTC head
-        # (ctc_head.py) is attached fresh and trained in Phase 1.
-        if "ctc" in model_id.lower():
+        # SSL ONLY: never load Meta's CTC-finetuned checkpoint — we train our own CTC head.
+        card = _omni_card(model_id)
+        if "ctc" in card.lower().split("_"):
             raise ValueError(
                 f"encoder_id={model_id!r} looks like a CTC-finetuned checkpoint. Use the SSL "
-                "checkpoint (omniASR_W2V_*) — we attach and train our own CTC head.")
-        # Attempt 1: Meta omnilingual-asr package (fairseq2-based) — load the SSL encoder body.
-        try:
-            import omnilingual_asr  # noqa: F401  (presence check)
-            raise ImportError("omnilingual_asr present but wrapper API to be wired on GPU box")
-        except Exception as e:
-            log.info("omnilingual_asr path not used (%s); trying HF Wav2Vec2Model", e)
-        # Attempt 2: HF wav2vec2-family (the SSL model exposes only the encoder, no CTC head).
-        from transformers import AutoModel
-        m = AutoModel.from_pretrained(model_id, trust_remote_code=True).to(dtype)
-        out_dim = int(m.config.hidden_size)
+                "checkpoint (omniASR-W2V-*) — we attach and train our own CTC head.")
         hop = 320                                    # wav2vec2 conv stack: 20 ms/frame -> 50 fps
+
+        # Attempt 1: fairseq2 / omnilingual-asr (registers Meta's asset cards)
+        try:
+            import omnilingual_asr  # noqa: F401  — registers omniASR_* cards
+            from fairseq2.models.hub import load_model
+            m = load_model(card)
+            m.eval()
+            out_dim = int(getattr(m, "model_dim", 0) or getattr(
+                getattr(m, "encoder_frontend", None), "model_dim", 0) or 1024)
+            log.info("loaded omniASR SSL via fairseq2 (%s) | out_dim=%d | 50 fps", card, out_dim)
+            return cls(m, out_dim, SAMPLE_RATE / hop, hop, chunk_frames, left_chunks,
+                       "omni-w2v-fairseq2")
+        except Exception as e:
+            log.info("fairseq2 path not used (%s); trying HF Wav2Vec2Model", e)
+
+        # Attempt 2: Transformers Wav2Vec2 — official facebook/* has no config.json;
+        # use the parity-verified mirror when the id is a Meta card / Hub path.
+        hf_id = model_id
+        if model_id.startswith("facebook/") or "/" not in model_id:
+            mirror = _omni_hf_mirror(card)
+            if not mirror:
+                raise SystemExit(
+                    f"no Transformers mirror for {card!r}; install omnilingual-asr "
+                    f"(fairseq2) or use facebook/omniASR-W2V-300M / -1B")
+            hf_id = mirror
+            log.info("using HF Wav2Vec2 mirror %s for Meta card %s", hf_id, card)
+        from transformers import Wav2Vec2Model
+        m = Wav2Vec2Model.from_pretrained(hf_id).to(dtype)
+        out_dim = int(m.config.hidden_size)
         log.info("loaded omniASR SSL encoder (%s) | out_dim=%d | 50 fps | CTC head is OURS, fresh",
-                 model_id, out_dim)
-        return cls(m, out_dim, SAMPLE_RATE / hop, hop, chunk_frames, left_chunks, "omni-w2v-ssl")
+                 hf_id, out_dim)
+        return cls(m, out_dim, SAMPLE_RATE / hop, hop, chunk_frames, left_chunks, "omni-w2v-hf")
 
     def _flen(self, wave_len):
         return torch.clamp(torch.div(wave_len, self.hop_samples, rounding_mode="floor"), min=1)
 
+    def _features_fairseq2(self, wave, wave_len):
+        """Extract [B,T,D] embeddings from a fairseq2 Wav2Vec2Model."""
+        try:
+            from fairseq2.nn import BatchLayout
+        except ImportError:
+            from fairseq2.data import BatchLayout  # older fairseq2
+        seq_lens = [int(x) for x in wave_len.tolist()]
+        try:
+            layout = BatchLayout.of(wave, seq_lens)
+        except TypeError:
+            layout = BatchLayout.of(batch=wave, seq_lens=seq_lens)
+        m = self.model
+        if hasattr(m, "encoder_frontend") and hasattr(m, "encoder"):
+            packed = m.encoder_frontend.extract_features(wave, layout)
+            enc_out, enc_layout = packed[0], packed[1]
+            if hasattr(m.encoder_frontend, "process_features"):
+                try:
+                    enc_out, enc_layout = m.encoder_frontend.process_features(
+                        enc_out, enc_layout, None)
+                except TypeError:
+                    enc_out, enc_layout = m.encoder_frontend.process_features(enc_out, enc_layout)
+            feats = m.encoder(enc_out, enc_layout)
+            if isinstance(feats, tuple):
+                feats = feats[0]
+            return feats, self._flen(wave_len)
+        out = m(wave, layout)
+        feats = out[0] if isinstance(out, tuple) else out
+        return feats, self._flen(wave_len)
+
     def features(self, wave, wave_len):
+        if self.kind == "omni-w2v-fairseq2":
+            return self._features_fairseq2(wave, wave_len)
+        # HF Wav2Vec2Model: raw waveform [B,S] → last_hidden_state [B,T,D]
         out = self.model(wave)
         feats = out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0]
         T = feats.shape[1]

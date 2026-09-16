@@ -17,7 +17,9 @@ NANDI_EMBED_RANK = 196                            # factorized embedding rank
 # omniASR_W2V — Meta Omnilingual SSL wav2vec2 backbone (raw, no baked-in vocab).
 # Exact HF id / package API confirmed on the GPU box (PLAN §9 item 1); the encoder
 # wrapper discovers out_dim + frame_rate at runtime, never hardcodes them.
-OMNI_W2V_ID = "facebook/omniASR_W2V_300M"         # placeholder id; overridable in config
+# Official Meta Hub id uses hyphens (fairseq2 asset). Transformers loads the
+# parity-verified mirror via encoders._omni_hf_mirror — see OmniW2VEncoder.load.
+OMNI_W2V_ID = "facebook/omniASR-W2V-300M"
 SAMPLE_RATE = 16_000                              # all audio resampled to 16 kHz mono
 
 # --------------------------------------------------------------------------

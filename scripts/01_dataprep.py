@@ -31,7 +31,7 @@ from kupefdx.text import normalize
 # name -> (hf_dataset_id, config, split, audio_col, text_col)
 SOURCES = {
     "fleurs_hi": ("google/fleurs", "hi_in", "train", "audio", "transcription"),
-    "common_voice_hi": ("mozilla-foundation/common_voice_17_0", "hi", "train",
+    "common_voice_hi": ("mozilla-foundation/common_voice_16_1", "hi", "train",
                         "audio", "sentence"),
 }
 

@@ -41,7 +41,7 @@ from kupefdx.text import normalize
 
 SOURCES = {
     "fleurs_hi": ("google/fleurs", "hi_in", "train", "audio", "transcription"),
-    "common_voice_hi": ("mozilla-foundation/common_voice_17_0", "hi", "train", "audio", "sentence"),
+    "common_voice_hi": ("mozilla-foundation/common_voice_16_1", "hi", "train", "audio", "sentence"),
     # add Shrutilipi / IndicVoices / Kathbath adapters here (same 5-tuple shape).
 }
 
