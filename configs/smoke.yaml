@@ -1,0 +1,93 @@
+# Smoke config — tiny models, synthetic data, CPU/MPS. Proves the whole pipeline
+# wires up before the H100 run. Nothing here needs network/tokens.
+project: kupe-fdx-hi-asr
+seed: 1337
+owner: anuj-inavlabs
+backend: tiny            # tiny -> TinyEncoder + TinyNandi ; real -> omniASR_W2V + Nandi
+
+repos:                   # only used if train.push_to_hub / hf scripts run
+  data: "{owner}/kupe-hi-asr-data"
+  runs: "{owner}/KupeFDX-hi-asr-runs"
+  model: "{owner}/KupeFDX-hi-asr"
+
+paths:
+  data_dir: data
+  runs_dir: checkpoints
+  ledger_dir: data/manifests
+  feats_dir: data/encoded/feats
+  raw_dir: data/raw
+
+base:
+  encoder_id: facebook/omniASR_W2V_300M
+  decoder_id: FrontiersMind/Nandi-Mini-150M
+  trust_remote_code: true
+  attn_impl: eager
+  dtype: float32         # bf16 only kicks in on cuda (see train.py)
+  tiny_hidden: 64        # TinyNandi mirrors Nandi's factorized/tied/layer-sharing shape
+  tiny_rank: 16
+  tiny_layers: 2
+
+audio:
+  projector: mlp
+  proj_dropout: 0.0
+  n_codes: 16            # discrete audio-token branch ON (0 disables it)
+  chunk_frames: 8        # block-causal streaming mask (~160 ms chunks @50fps)
+  left_chunks: 1
+  tiny_enc_dim: 64
+  tiny_enc_layers: 2
+
+model:
+  max_audio_frames: 400
+  max_text_tokens: 64
+
+data:
+  manifest: data/smoke/manifest.jsonl
+  max_dur: 30.0
+  min_hours: 0           # smoke: no min-hours gate
+  use_cached_feats: false
+
+train:
+  epochs: 2
+  batch_size: 4
+  grad_accum: 1
+  lr: 0.001
+  weight_decay: 0.01
+  warmup_ratio: 0.1
+  max_grad_norm: 1.0
+  bf16: false
+  num_workers: 0
+  logging_steps: 2
+  eval_steps: 8
+  save_steps: 6
+  fc_weight: 3.0
+  eos_lead_ms: 160        # predictive end-of-turn: label EOS ~160ms early (sub-100ms endpoint)
+  push_to_hub: false
+
+fc:
+  distribution:
+    nothing_happens: 20
+    clean_end_of_speech: 15
+    midsentence_pause: 12
+    backchannel: 18
+    expression: 8
+    thinking_sound: 8
+    sustained_silence: 6
+    false_trigger_trap: 8
+    barge_in: 5
+
+stream:
+  chunk_ms: 80
+  endpoint_mode: predictive
+  emit_ctc_draft: false
+  temperature: 1.0
+  thresholds: {"<BC>": 0.40, "<THINK>": 0.50, "<EOS_SPEECH>": 0.55, "<SILENCE>": 0.60}
+  biases:     {"<BC>": 0.0,  "<THINK>": 0.0,  "<EOS_SPEECH>": 0.0,  "<SILENCE>": 0.0}
+  min_gaps:   {"<BC>": 2,    "<THINK>": 3,    "<EOS_SPEECH>": 0,    "<SILENCE>": 4}
+
+eval:
+  subset_samples: 4
+  max_samples: 8
+  max_new_tokens: 16
+  batch_size: 4
+  wer_pass: 0.05         # <5% WER gate (meaningful only on the real run)
+  wer_broken: 0.90

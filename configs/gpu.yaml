@@ -1,0 +1,103 @@
+# H100 config — real omniASR_W2V + Nandi-Mini-150M, full finetune. Same code as smoke;
+# only `backend`, data scale, and sizes change. Set HF_TOKEN + WANDB_API_KEY in .env.
+project: kupe-fdx-hi-asr
+seed: 1337
+owner: anuj-inavlabs
+backend: real
+
+repos:
+  data: "{owner}/kupe-hi-asr-data"
+  runs: "{owner}/KupeFDX-hi-asr-runs"
+  model: "{owner}/KupeFDX-hi-asr"
+
+paths:
+  data_dir: data
+  runs_dir: checkpoints
+  ledger_dir: data/manifests
+  feats_dir: data/encoded/feats
+  raw_dir: data/raw
+
+base:
+  # ENCODER = Omnilingual SSL wav2vec2 (self-supervised weights ONLY).
+  # IMPORTANT: use the raw SSL checkpoint (omniASR_W2V_*), NOT the CTC-finetuned one
+  # (omniASR-CTC-*). We attach and TRAIN OUR OWN CTC head — none of Meta's CTC/decoder
+  # weights are loaded. The SSL encoder has no output vocabulary baked in, so there is
+  # no tokenizer mismatch.
+  encoder_type: omni_w2v                     # omni_w2v | fastconformer | indicconformer
+  encoder_id: facebook/omniASR_W2V_300M      # the SSL (W2V) checkpoint — confirm exact id (PLAN §9.1)
+  # Fallback if Hindi WER stalls (measured 2026 benchmarks favour it — ENCODER_DECISION.md):
+  #   encoder_type: fastconformer ; encoder_id: ai4bharat/indic-conformer-600m-multilingual
+  decoder_id: FrontiersMind/Nandi-Mini-150M
+  trust_remote_code: true
+  attn_impl: sdpa
+  dtype: bfloat16
+
+audio:
+  projector: mlp
+  proj_dropout: 0.1
+  n_codes: 0             # 0 = continuous soft-prompts only (recommended; see paper §6/§7)
+  # chunk size is in ENCODER frames; ms depends on the encoder frame rate:
+  #   omniASR_W2V   50   fps (20 ms/frame): 32 frames = 640 ms   <-- default (Omni SSL)
+  #   FastConformer 12.5 fps (80 ms/frame): 8 frames  = 640 ms
+  chunk_frames: 16       # encoder attention block (~320 ms @50fps); accuracy vs latency
+  left_chunks: 4         # past context is free (already buffered) — no latency cost
+  right_chunks: 0        # LOOKAHEAD = 0 -> pure causal -> lowest latency (raise only if WER needs it)
+
+model:
+  max_audio_frames: 1500
+  max_text_tokens: 256
+
+data:
+  manifest: data/manifests/train.jsonl
+  max_dur: 30.0
+  min_hours: 2000        # refuse to launch the main run on too little data
+  use_cached_feats: true # phase 2 reads cached feats (frozen encoder)
+
+train:
+  epochs: 3
+  batch_size: 16
+  grad_accum: 2
+  lr: 0.0001
+  weight_decay: 0.01
+  warmup_ratio: 0.03
+  max_grad_norm: 1.0
+  bf16: true
+  num_workers: 8
+  logging_steps: 25
+  eval_steps: 1000
+  save_steps: 1000
+  fc_weight: 3.0
+  eos_lead_ms: 160        # predictive end-of-turn: label EOS ~160ms early (sub-100ms endpoint)
+  push_to_hub: true
+
+# floor-control DATA generation: scenario mix (tune freely; ~sum to 100).
+fc:
+  distribution:
+    nothing_happens: 20
+    clean_end_of_speech: 15
+    midsentence_pause: 12
+    backchannel: 18
+    expression: 8
+    thinking_sound: 8
+    sustained_silence: 6
+    false_trigger_trap: 8
+    barge_in: 5
+
+# INFERENCE-TIME floor-control controls (the "temperature" analog; override per deployment).
+# bias > 0 => that signal fires more eagerly; threshold => min prob to fire; min_gap => chunks.
+stream:
+  chunk_ms: 80              # react every 80 ms -> ~<100 ms end-of-turn (with predictive endpoint)
+  endpoint_mode: predictive # predictive = fire EOS when the turn LOOKS done (no silence wait)
+  emit_ctc_draft: false     # transcript = Nandi only
+  temperature: 1.0
+  thresholds: {"<BC>": 0.40, "<THINK>": 0.50, "<EOS_SPEECH>": 0.55, "<SILENCE>": 0.60}
+  biases:     {"<BC>": 0.0,  "<THINK>": 0.0,  "<EOS_SPEECH>": 0.0,  "<SILENCE>": 0.0}
+  min_gaps:   {"<BC>": 2,    "<THINK>": 3,    "<EOS_SPEECH>": 0,    "<SILENCE>": 4}
+
+eval:
+  subset_samples: 200
+  max_samples: 2000
+  max_new_tokens: 256
+  batch_size: 16
+  wer_pass: 0.05
+  wer_broken: 0.90

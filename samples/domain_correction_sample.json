@@ -1,0 +1,21 @@
+{
+  "id": "train_0006_dom00",
+  "lang": "hi",
+  "domain": "general",
+  "scenario": "domain_correction",
+  "audio": "data/smoke/wavs/train_0006.wav",
+  "text": "नमस्ते आप कैसे हैं kaise ho",
+  "target_sequence": "नमस्ते आप कैसे हैं कैसे हो",
+  "context": [],
+  "correction_spans": [
+    {
+      "raw": "kaise ho",
+      "fixed": "कैसे हो",
+      "reason": "domain term"
+    }
+  ],
+  "chunk_boundaries_ms": [],
+  "timeline": [],
+  "provenance": "domain-mock",
+  "split": "train"
+}

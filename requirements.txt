@@ -1,0 +1,15 @@
+# Core (present on the Mac dev box already: torch 2.12, transformers 4.57, numpy, soundfile, wandb, huggingface_hub)
+torch>=2.4
+transformers>=4.45
+numpy>=1.26
+soundfile>=0.12
+huggingface_hub>=0.25
+pyyaml>=6.0
+tqdm>=4.66
+# Optional — used on the GPU box / real backend. Smoke test does NOT need these.
+wandb>=0.17            # experiment tracking (auto-disabled if WANDB_API_KEY unset)
+datasets>=2.20         # pulling public Hindi corpora in 01_dataprep
+python-dotenv>=1.0     # .env loading for HF_TOKEN / WANDB_API_KEY
+librosa>=0.10          # resampling fallback when torchaudio absent
+# Real encoder backend (H100 only) — confirm exact package/version in PLAN §9 item 1:
+#   omnilingual-asr  (Meta's package)  OR  fairseq2   — install on the GPU box.
