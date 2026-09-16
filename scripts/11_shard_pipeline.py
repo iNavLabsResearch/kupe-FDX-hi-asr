@@ -77,7 +77,10 @@ def shard_stream(a):
     else:
         from datasets import load_dataset
         ds_id, cfg_name, split, acol, tcol = SOURCES[a.hf]
-        ds = load_dataset(ds_id, cfg_name, split=split, streaming=True)
+        try:
+            ds = load_dataset(ds_id, cfg_name, split=split, streaming=True, trust_remote_code=True)
+        except TypeError:
+            ds = load_dataset(ds_id, cfg_name, split=split, streaming=True)
         it = iter(ds)
         si = 0
         while True:
