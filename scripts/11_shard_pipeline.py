@@ -173,10 +173,15 @@ def main():
                     r["codes"] = f"shards/{sid}/{r['id']}.codes.npy"
             # 2) shard manifest
             write_manifest(os.path.join(work, "manifest.jsonl"), rows)
-            # 3) push RAW (always) + ENCODED (unless raw-only)
-            for r in rows:                          # raw wavs
-                upload_file(r["audio"], cfg.repos.data, "dataset",
-                            f"raw/{sid}/{os.path.basename(r['audio'])}", f"raw {sid}")
+            # 3) push RAW (always) + ENCODED (unless raw-only) — ONE folder commit each (fast)
+            raw_stage = os.path.join(work, "raw")
+            os.makedirs(raw_stage, exist_ok=True)
+            for r in rows:
+                shutil.copy2(r["audio"], os.path.join(raw_stage, os.path.basename(r["audio"])))
+            log.info("shard %s: %d clips downloaded -> uploading raw...", sid, len(rows))
+            upload_folder(raw_stage, cfg.repos.data, "dataset", path_in_repo=f"raw/{sid}",
+                          commit_message=f"raw {sid}")
+            shutil.rmtree(raw_stage, ignore_errors=True)
             sub = "manifests" if a.raw_only else "encoded"
             upload_folder(work, cfg.repos.data, "dataset", path_in_repo=f"{sub}/{sid}",
                           commit_message=f"{sub} {sid}")
