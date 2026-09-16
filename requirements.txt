@@ -8,7 +8,7 @@ pyyaml>=6.0
 tqdm>=4.66
 # Optional — used on the GPU box / real backend. Smoke test does NOT need these.
 wandb>=0.17            # experiment tracking (auto-disabled if WANDB_API_KEY unset)
-datasets>=2.20         # pulling public Hindi corpora in 01_dataprep
+datasets>=2.19,<3.0    # v3+ dropped script-dataset support (FLEURS/CommonVoice need it)
 python-dotenv>=1.0     # .env loading for HF_TOKEN / WANDB_API_KEY
 librosa>=0.10          # resampling fallback when torchaudio absent
 # System deps (GPU box): apt-get install -y libsndfile1   # required by fairseq2/omnilingual-asr
