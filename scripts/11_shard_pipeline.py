@@ -76,7 +76,10 @@ def shard_stream(a):
             yield si, rows
     else:
         from datasets import load_dataset
-        ds_id, cfg_name, split, acol, tcol = SOURCES[a.hf]
+        if a.hf_id:
+            ds_id, cfg_name, split, acol, tcol = a.hf_id, a.hf_config, a.split, a.audio_col, a.text_col
+        else:
+            ds_id, cfg_name, split, acol, tcol = SOURCES[a.hf]
         try:
             ds = load_dataset(ds_id, cfg_name, split=split, streaming=True, trust_remote_code=True)
         except TypeError:
@@ -87,8 +90,9 @@ def shard_stream(a):
             total = load_dataset_builder(ds_id, cfg_name).info.splits[split].num_examples
         except Exception:
             total = None
-        log.info("streaming %s (first shard downloads the archive — hold on)...", a.hf)
-        bar = tqdm(total=total, unit="clip", desc=f"{a.hf}", dynamic_ncols=True)
+        name = (a.hf or a.hf_id).replace("/", "_")
+        log.info("streaming %s (first shard downloads the archive — hold on)...", name)
+        bar = tqdm(total=total, unit="clip", desc=name, dynamic_ncols=True)
         rows, si, j, kept_h = [], 0, 0, 0.0
         for ex in ds:                              # incremental: save each clip as it arrives
             bar.update(1); j += 1
@@ -100,7 +104,7 @@ def shard_stream(a):
             dur = len(arr) / SAMPLE_RATE
             if not _keep(text, dur):
                 continue
-            cid = f"{a.hf}_{si:04d}_{j:06d}"
+            cid = f"{name}_{si:04d}_{j:06d}"
             p = os.path.join(raw_dir, cid + ".wav")
             save_wav(p, arr)
             rows.append({"id": cid, "audio": p, "text": text, "dur": dur,
@@ -120,6 +124,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="configs/gpu.yaml")
     ap.add_argument("--hf", default=None, choices=list(SOURCES))
+    # generic HF source (any dataset): overrides --hf shortcuts
+    ap.add_argument("--hf-id", default=None, help="any HF dataset id, e.g. ai4bharat/indicvoices")
+    ap.add_argument("--hf-config", default=None, help="dataset config/subset, e.g. hi")
+    ap.add_argument("--split", default="train")
+    ap.add_argument("--audio-col", default="audio")
+    ap.add_argument("--text-col", default="sentence")
     ap.add_argument("--local-dir", default=None)
     ap.add_argument("--domain", default="general")
     ap.add_argument("--shard-size", type=int, default=500)
@@ -130,7 +140,7 @@ def main():
                     help="download + push RAW audio only (skip the encoder); encode later")
     a = ap.parse_args()
     cfg = a_cfg = load_config(a.config)
-    if not a.hf and not a.local_dir:
+    if not a.hf and not a.hf_id and not a.local_dir:
         raise SystemExit("give --hf or --local-dir")
     dev = device_auto()
     hf_login()
@@ -144,7 +154,7 @@ def main():
 
     led = ShardLedger(os.path.join(cfg.paths.ledger_dir, "shardpipe.json"), "shardpipe",
                       repo_id=cfg.repos.data)
-    src = a.hf or a.local_dir
+    src = (a.hf or a.hf_id or a.local_dir).replace("/", "_")
     total_h = led.total_meta("hours")
 
     @torch.no_grad()
