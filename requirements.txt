@@ -3,7 +3,7 @@ torch>=2.4
 transformers>=4.45
 numpy>=1.26
 soundfile>=0.12
-huggingface_hub>=0.25
+huggingface_hub>=0.24,<0.26   # <0.26 keeps is_offline_mode for transformers compat
 pyyaml>=6.0
 tqdm>=4.66
 # Optional — used on the GPU box / real backend. Smoke test does NOT need these.
@@ -11,5 +11,6 @@ wandb>=0.17            # experiment tracking (auto-disabled if WANDB_API_KEY uns
 datasets>=2.20         # pulling public Hindi corpora in 01_dataprep
 python-dotenv>=1.0     # .env loading for HF_TOKEN / WANDB_API_KEY
 librosa>=0.10          # resampling fallback when torchaudio absent
+# System deps (GPU box): apt-get install -y libsndfile1   # required by fairseq2/omnilingual-asr
 # Real encoder backend (H100 only) — confirm exact package/version in PLAN §9 item 1:
 #   omnilingual-asr  (Meta's package)  OR  fairseq2   — install on the GPU box.

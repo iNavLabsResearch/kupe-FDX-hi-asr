@@ -72,7 +72,8 @@ disk never fills, and it's resumable per shard. Target ≈**3,200 h** total (see
 # one box, all shards (500 clips/shard):
 python scripts/11_shard_pipeline.py --config configs/gpu.yaml --hf fleurs_hi        --shard-size 500
 python scripts/11_shard_pipeline.py --config configs/gpu.yaml --hf common_voice_hi  --shard-size 500
-python scripts/11_shard_pipeline.py --config configs/gpu.yaml --local-dir /data/hi_medical --domain medical --shard-size 500
+# (OPTIONAL) your own local audio, tagged by domain — skip if you have none:
+# python scripts/11_shard_pipeline.py --config configs/gpu.yaml --local-dir /data/hi_medical --domain medical --shard-size 500
 
 # PARALLEL across 2 GPUs (interleaved shards run "meanwhile"):
 CUDA_VISIBLE_DEVICES=0 python scripts/11_shard_pipeline.py --config configs/gpu.yaml --hf shrutilipi_hi --shard-size 500 --shard-start 0 --stride 2 &
