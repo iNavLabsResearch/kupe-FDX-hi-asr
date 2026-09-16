@@ -185,32 +185,20 @@ class OmniW2VEncoder(nn.Module):
         return torch.clamp(torch.div(wave_len, self.hop_samples, rounding_mode="floor"), min=1)
 
     def _features_fairseq2(self, wave, wave_len):
-        """Extract [B,T,D] embeddings from a fairseq2 Wav2Vec2Model."""
-        try:
-            from fairseq2.nn import BatchLayout
-        except ImportError:
-            from fairseq2.data import BatchLayout  # older fairseq2
+        """Extract [B,T,D] embeddings from a fairseq2 Wav2Vec2Model (inference, no masker).
+
+        Important: frontend.process_features returns (seqs, temporal_mask) — NOT layout.
+        Use frontend.forward which keeps the layout, then run the encoder.
+        """
+        from fairseq2.nn import BatchLayout
         seq_lens = [int(x) for x in wave_len.tolist()]
-        try:
-            layout = BatchLayout.of(wave, seq_lens)
-        except TypeError:
-            layout = BatchLayout.of(batch=wave, seq_lens=seq_lens)
+        layout = BatchLayout.of(wave, seq_lens)
         m = self.model
-        if hasattr(m, "encoder_frontend") and hasattr(m, "encoder"):
-            packed = m.encoder_frontend.extract_features(wave, layout)
-            enc_out, enc_layout = packed[0], packed[1]
-            if hasattr(m.encoder_frontend, "process_features"):
-                try:
-                    enc_out, enc_layout = m.encoder_frontend.process_features(
-                        enc_out, enc_layout, None)
-                except TypeError:
-                    enc_out, enc_layout = m.encoder_frontend.process_features(enc_out, enc_layout)
-            feats = m.encoder(enc_out, enc_layout)
-            if isinstance(feats, tuple):
-                feats = feats[0]
-            return feats, self._flen(wave_len)
-        out = m(wave, layout)
-        feats = out[0] if isinstance(out, tuple) else out
+        # Wav2Vec2Frontend.forward: extract_features → process_features(masker=None)
+        enc_out, enc_layout = m.encoder_frontend(wave, layout)
+        feats = m.encoder(enc_out, enc_layout)
+        if isinstance(feats, tuple):
+            feats = feats[0]
         return feats, self._flen(wave_len)
 
     def features(self, wave, wave_len):

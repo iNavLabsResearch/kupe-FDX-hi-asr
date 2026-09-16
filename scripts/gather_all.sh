@@ -30,10 +30,10 @@ fi
 
 # name | hf_id | config | split | domain
 # OpenSLR-only packs (MUCS, Gramvaani) are not HF-streamable — drop those in via --local-dir.
-# CV 17 is gated / often empty without accepting terms — use 16_1 (also gated; accept on HF).
+# Common Voice: HF mirrors are gated/empty since Mozilla moved to Data Collective — skip here;
+#   use --local-dir after manual download if needed.
 DATASETS=(
   "fleurs_hi|google/fleurs|hi_in|train|general"
-  "common_voice_hi|mozilla-foundation/common_voice_16_1|hi|train|general"
   "shrutilipi_hi|ai4bharat/Shrutilipi|hindi|train|news"
   "indicvoices_hi|ai4bharat/IndicVoices|hindi|train|spontaneous"
   "kathbath_hi|ai4bharat/Kathbath|hindi|train|read"
