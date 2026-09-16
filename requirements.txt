@@ -1,9 +1,9 @@
 # Core (present on the Mac dev box already: torch 2.12, transformers 4.57, numpy, soundfile, wandb, huggingface_hub)
 torch>=2.4
-transformers>=4.45
+transformers>=4.48                # >=4.48 works with huggingface_hub 0.26+/0.36 (no is_offline_mode import)
 numpy>=1.26
 soundfile>=0.12
-huggingface_hub>=0.24,<0.26   # <0.26 keeps is_offline_mode for transformers compat
+huggingface_hub>=0.24
 pyyaml>=6.0
 tqdm>=4.66
 # Optional — used on the GPU box / real backend. Smoke test does NOT need these.
