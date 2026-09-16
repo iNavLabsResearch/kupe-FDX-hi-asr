@@ -1,15 +1,12 @@
 #!/usr/bin/env python3
-"""Stage 1+2 fused — continuous pipeline (download ‖ encode ‖ push):
+"""Stage 1+2 fused — continuous pipeline (download ‖ encode ‖ batched Hub push):
 
-  download thread  →  shard queue  →  GPU encode (main)  →  upload queue  →  Hub
+  download → shard queue → GPU encode → upload batch queue → Hub (few commits)
 
-Download never waits on the GPU except when the prefetch buffer is full
-(--prefetch shards on disk). Encode never waits on Hub. Two tqdm bars show
-download vs encode progress.
+Resume-safe: Hub-synced done shards are never re-encoded. Hub rate-limit (128
+commits/hour) handled by batching + 429 retry — encode keeps going.
 
-    python scripts/11_shard_pipeline.py --config configs/gpu.yaml \\
-        --hf-id ai4bharat/Shrutilipi --hf-config hindi --shard-size 2000 \\
-        --encode-batch 48 --prefetch 8
+    ONLY=shrutilipi_hi bash scripts/gather_all.sh
 """
 from __future__ import annotations
 
@@ -22,6 +19,7 @@ import shutil
 import sys
 import tempfile
 import threading
+import time
 from queue import Queue
 
 import numpy as np
@@ -34,7 +32,7 @@ from kupefdx.config import load_config
 from kupefdx.constants import SAMPLE_RATE, SPLIT_TEST, SPLIT_TRAIN, SPLIT_VAL
 from kupefdx.dataset import write_manifest
 from kupefdx.encoders import build_encoder
-from kupefdx.env import device_auto, ensure_repo, hf_login, log, upload_file, upload_folder
+from kupefdx.env import device_auto, ensure_repo, hf_login, log, require_token, upload_file, upload_folder
 from kupefdx.ledger import ShardLedger
 from kupefdx.quantizer import KMeansQuantizer
 from kupefdx.text import normalize
@@ -54,6 +52,19 @@ def _split_of(cid, val=0.02, test=0.02):
 
 def _keep(text, dur):
     return 0.5 <= dur <= 30.0 and len(normalize(text)) >= 2
+
+
+def _keep_light(text, ex) -> bool:
+    """Keep-check without decoding audio (for fast-skip of done shards)."""
+    if len(normalize(text)) < 2:
+        return False
+    for k in ("duration", "duration_seconds", "duration_ms", "audio_duration"):
+        if k in ex and ex[k] is not None:
+            d = float(ex[k])
+            if k.endswith("_ms"):
+                d /= 1000.0
+            return 0.5 <= d <= 30.0
+    return True  # assume ok when skipping already-done region
 
 
 def _detect_cols(ex, acol, tcol):
@@ -86,15 +97,68 @@ def _estimate_total(a):
         return None
 
 
-def _stage_link(src, dst):
+def _sid(src_name, shard_size, si):
+    return f"{src_name}_n{shard_size}_shard_{si:05d}"
+
+
+def sync_done_from_hub(led: ShardLedger, repo_id: str, src_name: str, shard_size: int) -> int:
+    """Mark any shard that already has feats.npz (or legacy .npy) on Hub as done."""
     try:
-        os.link(src, dst)
-    except OSError:
-        shutil.copy(src, dst)
+        from huggingface_hub import HfApi
+        files = HfApi().list_repo_files(repo_id, repo_type="dataset", token=require_token())
+    except Exception as e:
+        tqdm.write(f"hub sync skipped: {e}")
+        return 0
+    prefix = f"encoded/{src_name}_n{shard_size}_shard_"
+    # also older naming without n{size}
+    prefix_old = f"encoded/{src_name}_shard_"
+    found = set()
+    for f in files:
+        if "/feats.npz" in f or f.endswith(".feats.npy"):
+            # encoded/<sid>/feats.npz  OR encoded/<sid>/<id>.feats.npy
+            parts = f.split("/")
+            if len(parts) >= 2 and parts[0] == "encoded":
+                sid = parts[1]
+                if sid.startswith(src_name):
+                    found.add(sid)
+    n = 0
+    for sid in sorted(found):
+        if not led.is_done(sid):
+            led.mark(sid, "done", clips=0, hours=0, source="hub_sync")
+            n += 1
+    if n:
+        led.save()
+        tqdm.write(f"hub sync: marked {n} already-uploaded shards done (won't redo)")
+    # count how many consecutive from 0 are done
+    si = 0
+    while led.is_done(_sid(src_name, shard_size, si)) or led.is_done(f"{src_name}_shard_{si:05d}"):
+        si += 1
+    if si:
+        tqdm.write(f"resume after shard index {si - 1} → next todo = {_sid(src_name, shard_size, si)}")
+    return si
 
 
-def download_worker(a, cfg, src_name, led, dl_q: Queue, dl_bar: tqdm, err_box: list):
-    """Stream HF (or local) → write wav shards → put on dl_q. Never touches the GPU."""
+def _upload_retry(folder, repo_id, path_in_repo, msg, max_sleep=600):
+    """Upload with 429 backoff — never burn a GPU hour on a hard fail."""
+    sleep_s = 60
+    while True:
+        try:
+            upload_folder(folder, repo_id, "dataset", path_in_repo=path_in_repo,
+                          commit_message=msg)
+            return
+        except Exception as e:
+            err = str(e).lower()
+            if "429" in err or "rate limit" in err:
+                tqdm.write(f"Hub 429 rate limit — sleep {sleep_s}s then retry ({path_in_repo})")
+                time.sleep(sleep_s)
+                sleep_s = min(max_sleep, int(sleep_s * 1.5))
+                continue
+            raise
+
+
+def download_worker(a, cfg, src_name, led, dl_q: Queue, dl_bar: tqdm, err_box: list,
+                    first_todo_si: int):
+    """Stream HF → write wav shards. Skips done shards without decoding audio."""
     try:
         raw_root = os.path.join(cfg.paths.raw_dir, "wavs", src_name)
         os.makedirs(raw_root, exist_ok=True)
@@ -102,19 +166,19 @@ def download_worker(a, cfg, src_name, led, dl_q: Queue, dl_bar: tqdm, err_box: l
         def should_skip(si: int) -> bool:
             if (si % a.stride) != a.shard_start:
                 return True
-            return led.is_done(f"{src_name}_n{a.shard_size}_shard_{si:05d}")
+            return led.is_done(_sid(src_name, a.shard_size, si)) or \
+                led.is_done(f"{src_name}_shard_{si:05d}")
 
-        def emit(si, rows):
-            sid = f"{src_name}_n{a.shard_size}_shard_{si:05d}"
+        def emit(si, rows, end_j):
+            sid = _sid(src_name, a.shard_size, si)
             if should_skip(si):
                 for r in rows:
                     p = r.get("audio")
                     if p and os.path.isfile(p):
                         os.remove(p)
-                dl_bar.set_postfix_str(f"skip {sid[-20:]}")
                 return
             hours = sum(r["dur"] for r in rows) / 3600
-            dl_q.put((si, sid, rows, hours))
+            dl_q.put((si, sid, rows, hours, end_j))
             dl_bar.set_postfix(q=dl_q.qsize(), shard=si, kept_h=f"{hours:.1f}")
 
         if a.local_dir:
@@ -136,65 +200,95 @@ def download_worker(a, cfg, src_name, led, dl_q: Queue, dl_bar: tqdm, err_box: l
                         rows.append({"id": cid, "audio": wav, "text": text, "dur": dur,
                                      "domain": a.domain, "split": _split_of(cid)})
                 if rows:
-                    emit(si, rows)
+                    emit(si, rows, i + len(wavs[i:i + a.shard_size]))
+            return
+
+        from datasets import load_dataset
+        if a.hf_id:
+            ds_id, cfg_name, split, acol, tcol = (
+                a.hf_id, a.hf_config, a.split, a.audio_col, a.text_col)
         else:
-            from datasets import load_dataset
-            if a.hf_id:
-                ds_id, cfg_name, split, acol, tcol = (
-                    a.hf_id, a.hf_config, a.split, a.audio_col, a.text_col)
-            else:
-                ds_id, cfg_name, split, acol, tcol = SOURCES[a.hf]
-            try:
-                ds = load_dataset(ds_id, cfg_name, split=split, streaming=True,
-                                  trust_remote_code=True)
-            except TypeError:
-                ds = load_dataset(ds_id, cfg_name, split=split, streaming=True)
-            tqdm.write(f"streaming {src_name} (archives download on first touch)...")
-            it = iter(ds)
-            try:
-                first = next(it)
-            except StopIteration:
-                tqdm.write(f"{src_name} empty")
-                return
-            acol, tcol = _detect_cols(first, acol, tcol)
-            tqdm.write(f"columns: audio={acol} text={tcol}")
-            rows, si, j = [], 0, 0
-            skip = should_skip(0)
-            n_kept = 0
-            for ex in itertools.chain([first], it):
-                dl_bar.update(1)
-                j += 1
-                text = normalize(str(ex[tcol]))
-                aud = ex[acol]
-                if not isinstance(aud, dict) or "array" not in aud:
-                    continue
-                arr = np.asarray(aud["array"], dtype="float32")
-                sr = aud["sampling_rate"]
-                if sr != SAMPLE_RATE:
-                    arr = _resample(arr, sr, SAMPLE_RATE)
-                dur = len(arr) / SAMPLE_RATE
-                if not _keep(text, dur):
-                    continue
-                # Done / non-owned shards: advance stream without writing disk or GPU work
-                if skip:
-                    n_kept += 1
-                    if n_kept >= a.shard_size:
-                        dl_bar.set_postfix_str(f"skip shard {si}")
-                        si += 1
-                        n_kept = 0
-                        skip = should_skip(si)
-                    continue
-                cid = f"{src_name}_{si:04d}_{j:06d}"
-                p = os.path.join(raw_root, cid + ".wav")
-                save_wav(p, arr)
-                rows.append({"id": cid, "audio": p, "text": text, "dur": dur,
-                             "domain": a.domain, "split": _split_of(cid)})
-                if len(rows) >= a.shard_size:
-                    emit(si, rows)
-                    rows, si = [], si + 1
+            ds_id, cfg_name, split, acol, tcol = SOURCES[a.hf]
+        try:
+            ds = load_dataset(ds_id, cfg_name, split=split, streaming=True,
+                              trust_remote_code=True)
+        except TypeError:
+            ds = load_dataset(ds_id, cfg_name, split=split, streaming=True)
+
+        # Jump past done prefix using stored end_j when available
+        skip_until_j = 0
+        if first_todo_si > 0:
+            prev = _sid(src_name, a.shard_size, first_todo_si - 1)
+            skip_until_j = int(led.d.get("meta", {}).get(prev, {}).get("end_j") or 0)
+            if skip_until_j:
+                tqdm.write(f"fast-forward stream to j>{skip_until_j} "
+                           f"(skip re-download of done shards 0..{first_todo_si - 1})")
+
+        tqdm.write(f"streaming {src_name}...")
+        it = iter(ds)
+        try:
+            first = next(it)
+        except StopIteration:
+            tqdm.write(f"{src_name} empty")
+            return
+        acol, tcol = _detect_cols(first, acol, tcol)
+        tqdm.write(f"columns: audio={acol} text={tcol}")
+
+        rows, si, j, n_kept = [], 0, 0, 0
+        skip = should_skip(0)
+        for ex in itertools.chain([first], it):
+            j += 1
+            dl_bar.update(1)
+
+            # Cheap skip of already-finished prefix (no audio decode)
+            if skip_until_j and j <= skip_until_j:
+                if j == skip_until_j:
+                    si = first_todo_si
                     skip = should_skip(si)
-            if rows and not skip:
-                emit(si, rows)
+                    n_kept = 0
+                    rows = []
+                    dl_bar.set_postfix_str(f"resumed @ shard {si}")
+                continue
+
+            text = normalize(str(ex[tcol]))
+
+            if skip:
+                if not _keep_light(text, ex):
+                    continue
+                n_kept += 1
+                if n_kept >= a.shard_size:
+                    dl_bar.set_postfix_str(f"skip shard {si}")
+                    for cand in (_sid(src_name, a.shard_size, si),
+                                 f"{src_name}_shard_{si:05d}"):
+                        if led.is_done(cand):
+                            led.mark(cand, "done", end_j=j)
+                            break
+                    si += 1
+                    n_kept = 0
+                    skip = should_skip(si)
+                continue
+
+            aud = ex[acol]
+            if not isinstance(aud, dict) or "array" not in aud:
+                continue
+            arr = np.asarray(aud["array"], dtype="float32")
+            sr = aud["sampling_rate"]
+            if sr != SAMPLE_RATE:
+                arr = _resample(arr, sr, SAMPLE_RATE)
+            dur = len(arr) / SAMPLE_RATE
+            if not _keep(text, dur):
+                continue
+            cid = f"{src_name}_{si:04d}_{j:06d}"
+            p = os.path.join(raw_root, cid + ".wav")
+            save_wav(p, arr)
+            rows.append({"id": cid, "audio": p, "text": text, "dur": dur,
+                         "domain": a.domain, "split": _split_of(cid)})
+            if len(rows) >= a.shard_size:
+                emit(si, rows, j)
+                rows, si = [], si + 1
+                skip = should_skip(si)
+        if rows and not skip:
+            emit(si, rows, j)
     except Exception as e:
         err_box.append(e)
         tqdm.write(f"DOWNLOAD ERROR: {e}")
@@ -202,27 +296,84 @@ def download_worker(a, cfg, src_name, led, dl_q: Queue, dl_bar: tqdm, err_box: l
         dl_q.put(SENTINEL)
 
 
-def upload_worker(up_q: Queue, cfg, led, total_h_box: list, enc_bar: tqdm, err_box: list):
-    """Push packed payloads; delete staging when done."""
+def upload_worker(up_q: Queue, cfg, led, total_h_box: list, enc_bar: tqdm,
+                  upload_every: int):
+    """Batch several shards into ONE Hub commit; retry 429; never kill encode."""
+    batch = []  # list of (payload_parent, sid, n_clips, hours, end_j)
+    batch_root = None
+
+    def flush():
+        nonlocal batch, batch_root
+        if not batch:
+            return
+        # Build a single tree: encoded/<sid>/{feats.npz,manifest.jsonl}
+        tree = tempfile.mkdtemp(prefix="hubbatch_", dir=cfg.paths.data_dir)
+        sids = []
+        keep_tree = False
+        try:
+            for parent, sid, n_clips, hours, end_j in batch:
+                payload = os.path.join(parent, "payload")
+                dst = os.path.join(tree, "encoded", sid)
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                shutil.move(payload, dst)
+                sids.append((sid, n_clips, hours, end_j))
+                shutil.rmtree(parent, ignore_errors=True)
+            msg = f"encoded {sids[0][0]}..{sids[-1][0]} ({len(sids)} shards)"
+            _upload_retry(tree, cfg.repos.data, "", msg)
+            for sid, n_clips, hours, end_j in sids:
+                total_h_box[0] += hours
+                meta = {"clips": n_clips, "hours": hours}
+                if end_j:
+                    meta["end_j"] = end_j
+                led.mark(sid, "done", **meta)
+            led.save()
+            enc_bar.set_postfix(hub_q=up_q.qsize(), pushed_h=f"{total_h_box[0]:.1f}",
+                                batch=len(sids))
+            tqdm.write(f"Hub ok: {len(sids)} shards in 1 commit | "
+                       f"cumulative {total_h_box[0]:.1f} h")
+        except Exception as e:
+            keep_tree = True
+            tqdm.write(f"UPLOAD ERROR — payloads kept at {tree}: {e}")
+            raise
+        finally:
+            if not keep_tree:
+                shutil.rmtree(tree, ignore_errors=True)
+            batch = []
+
     try:
         while True:
             item = up_q.get()
             if item is SENTINEL:
+                try:
+                    flush()
+                except Exception:
+                    pass
+                # one ledger push at the very end
+                try:
+                    led.push(f"shardpipe checkpoint {total_h_box[0]:.1f}h")
+                except Exception:
+                    pass
                 break
-            payload, path_in_repo, msg, sid, n_clips, hours = item
-            parent = os.path.dirname(payload)  # hubup_*/payload
-            try:
-                upload_folder(payload, cfg.repos.data, "dataset", path_in_repo=path_in_repo,
-                              commit_message=msg)
-                total_h_box[0] += hours
-                led.mark(sid, "done", clips=n_clips, hours=hours)
-                led.push(f"shardpipe {sid} done ({total_h_box[0]:.1f} h total)")
-                enc_bar.set_postfix(hub_q=up_q.qsize(), pushed_h=f"{total_h_box[0]:.1f}")
-            finally:
-                shutil.rmtree(parent, ignore_errors=True)
+            parent, sid, n_clips, hours, end_j = item
+            batch.append((parent, sid, n_clips, hours, end_j))
+            if len(batch) >= max(1, upload_every):
+                try:
+                    flush()
+                except Exception as e:
+                    # On persistent non-429 failure, re-raise after logging
+                    if "429" not in str(e).lower() and "rate limit" not in str(e).lower():
+                        tqdm.write(f"upload batch failed: {e}")
+                    # 429 already retried inside _upload_retry forever; other errors:
+                    # put back? for now sleep and retry flush once more
+                    time.sleep(30)
+                    try:
+                        flush()
+                    except Exception:
+                        tqdm.write("upload still failing — encode continues; "
+                                   "re-run later to push remaining")
+                        batch = []  # avoid infinite loop on poison
     except Exception as e:
-        err_box.append(e)
-        tqdm.write(f"UPLOAD ERROR: {e}")
+        tqdm.write(f"upload worker exit: {e}")
 
 
 def main():
@@ -237,12 +388,11 @@ def main():
     ap.add_argument("--local-dir", default=None)
     ap.add_argument("--domain", default="general")
     ap.add_argument("--shard-size", type=int, default=2000)
-    ap.add_argument("--encode-batch", type=int, default=16,
-                    help="max clips per GPU forward (4090: 8–16; OOM auto-splits)")
-    ap.add_argument("--max-batch-sec", type=float, default=48.0,
-                    help="max padded audio-seconds per forward (B*max_dur); caps VRAM")
-    ap.add_argument("--prefetch", type=int, default=6,
-                    help="max shards buffered on disk waiting for GPU")
+    ap.add_argument("--encode-batch", type=int, default=16)
+    ap.add_argument("--max-batch-sec", type=float, default=48.0)
+    ap.add_argument("--prefetch", type=int, default=6)
+    ap.add_argument("--upload-every", type=int, default=8,
+                    help="shards per Hub commit (HF limit ≈128 commits/hour)")
     ap.add_argument("--shard-start", type=int, default=0)
     ap.add_argument("--stride", type=int, default=1)
     ap.add_argument("--no-flush", action="store_true")
@@ -285,11 +435,12 @@ def main():
     led = ShardLedger(os.path.join(cfg.paths.ledger_dir, "shardpipe.json"), "shardpipe",
                       repo_id=cfg.repos.data)
     src_name = (a.hf or a.hf_id or a.local_dir).replace("/", "_")
+    first_todo = sync_done_from_hub(led, cfg.repos.data, src_name, a.shard_size)
     total_h_box = [led.total_meta("hours")]
     total = _estimate_total(a)
 
     dl_q: Queue = Queue(maxsize=max(1, a.prefetch))
-    up_q: Queue = Queue(maxsize=max(2, a.prefetch))
+    up_q: Queue = Queue(maxsize=max(4, a.prefetch * 2))
     err_box: list = []
 
     dl_bar = tqdm(total=total, unit="ex", desc="download", position=0,
@@ -299,12 +450,12 @@ def main():
 
     t_dl = threading.Thread(
         target=download_worker,
-        args=(a, cfg, src_name, led, dl_q, dl_bar, err_box),
+        args=(a, cfg, src_name, led, dl_q, dl_bar, err_box, first_todo),
         name="download", daemon=True,
     )
     t_up = threading.Thread(
         target=upload_worker,
-        args=(up_q, cfg, led, total_h_box, enc_bar, err_box),
+        args=(up_q, cfg, led, total_h_box, enc_bar, a.upload_every),
         name="upload", daemon=True,
     )
     t_dl.start()
@@ -341,7 +492,6 @@ def main():
 
     @torch.no_grad()
     def feats_batch(rows):
-        """Length-sorted packing + OOM auto-split — cost-effective on 24GB."""
         items = [(r["audio"], float(r["dur"])) for r in rows]
         items.sort(key=lambda x: x[1])
         out_by_path = {}
@@ -376,8 +526,15 @@ def main():
                 break
             if err_box:
                 raise err_box[0]
-            si, sid, rows, hours = item
+            si, sid, rows, hours, end_j = item
             if not rows:
+                continue
+            # Belt-and-suspenders: never re-encode a done shard
+            if led.is_done(sid):
+                for r in rows:
+                    p = r.get("audio")
+                    if p and os.path.isfile(p):
+                        os.remove(p)
                 continue
 
             work = os.path.join(cfg.paths.data_dir, "encoded", "shards", sid)
@@ -411,20 +568,10 @@ def main():
 
                 write_manifest(os.path.join(hub, "manifest.jsonl"), rows)
 
-                if a.raw_only or a.push_raw:
-                    raw_stage = os.path.join(work, "raw")
-                    os.makedirs(raw_stage, exist_ok=True)
-                    for r in rows:
-                        _stage_link(r["audio"], os.path.join(raw_stage, os.path.basename(r["audio"])))
-                    upload_folder(raw_stage, cfg.repos.data, "dataset",
-                                  path_in_repo=f"raw/{sid}", commit_message=f"raw {sid}")
-                    shutil.rmtree(raw_stage, ignore_errors=True)
-
                 stage = tempfile.mkdtemp(prefix="hubup_", dir=cfg.paths.data_dir)
                 payload = os.path.join(stage, "payload")
                 shutil.copytree(hub, payload)
-                sub = "manifests" if a.raw_only else "encoded"
-                up_q.put((payload, f"{sub}/{sid}", f"{sub} {sid}", sid, len(rows), hours))
+                up_q.put((stage, sid, len(rows), hours, end_j))
 
                 enc_bar.update(len(rows))
                 enc_bar.set_postfix(q_dl=dl_q.qsize(), hub_q=up_q.qsize(),
@@ -439,7 +586,7 @@ def main():
     finally:
         up_q.put(SENTINEL)
         t_dl.join(timeout=5)
-        t_up.join(timeout=3600)
+        t_up.join(timeout=7200)
         dl_bar.close()
         enc_bar.close()
 

@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
-# gather_all.sh — continuous download ‖ encode ‖ Hub push (packed feats, no raw by default).
+# gather_all.sh — download ‖ encode ‖ batched Hub push (resume-safe).
 #
-# Cost-tuned defaults for a 24GB 4090 (~$0.79/hr):
-#   ENCODE_BATCH=16  MAX_BATCH_SEC=48  PREFETCH=6  SHARD_SIZE=2000
-#   (OOM auto-splits; done shards skip disk write)
+# Defaults avoid HF 128-commits/hour limit + 24GB OOM:
+#   SHARD_SIZE=2000 ENCODE_BATCH=16 UPLOAD_EVERY=8 PREFETCH=6
 #
 #   ONLY=shrutilipi_hi,indicvoices_hi,kathbath_hi bash scripts/gather_all.sh
 #
@@ -16,13 +15,19 @@ SHARD_SIZE="${SHARD_SIZE:-2000}"
 ENCODE_BATCH="${ENCODE_BATCH:-16}"
 MAX_BATCH_SEC="${MAX_BATCH_SEC:-48}"
 PREFETCH="${PREFETCH:-6}"
+UPLOAD_EVERY="${UPLOAD_EVERY:-8}"
 RAW_ONLY="${RAW_ONLY:-0}"
 PUSH_RAW="${PUSH_RAW:-0}"
 ONLY="${ONLY:-}"
 
-EXTRA=(--encode-batch "$ENCODE_BATCH" --max-batch-sec "$MAX_BATCH_SEC" --prefetch "$PREFETCH")
+EXTRA=(
+  --encode-batch "$ENCODE_BATCH"
+  --max-batch-sec "$MAX_BATCH_SEC"
+  --prefetch "$PREFETCH"
+  --upload-every "$UPLOAD_EVERY"
+)
 if [[ "$RAW_ONLY" == "1" ]]; then
-  EXTRA=(--raw-only --prefetch "$PREFETCH")
+  EXTRA=(--raw-only --prefetch "$PREFETCH" --upload-every "$UPLOAD_EVERY")
 elif [[ "$PUSH_RAW" == "1" ]]; then
   EXTRA+=(--push-raw)
 fi
