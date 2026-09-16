@@ -35,16 +35,16 @@ NOTHING = 0
 # in AR inference Nandi generates the word after the flag. These are the fast-path defaults
 # and the allowed set the validator checks against.
 SURFACES = {
-    FC_BACKCHANNEL: ["हाँ", "हूँ", "जी", "जी हाँ", "अच्छा", "ठीक", "ठीक है", "बिलकुल",
-                     "सही", "ओके", "ओह", "अरे", "अरे वाह", "वाह", "ओहो", "अहा",
-                     "हाहाहा", "हे हे", "बाप रे", "सच में"],
-    FC_THINK: ["हम्म", "हम्म्म", "उम्म", "आह", "ओह", "अच्छा", "देखिए", "ज़रा रुकिए",
-               "एक मिनट", "सोचने दीजिए"],
+    FC_BACKCHANNEL: ["yeah", "yes", "right", "okay", "ok", "sure", "got it", "mhm",
+                     "uh-huh", "i see", "oh", "oh really", "wow", "nice", "exactly",
+                     "haha", "gotcha", "for sure", "totally", "true"],
+    FC_THINK: ["hmm", "hmmm", "um", "uh", "let me see", "let me think", "one sec",
+               "okay so", "well", "give me a moment"],
 }
 # emotional-expression subset (used by the "expression" scenario in data generation).
-EXPRESSIONS = ["हाहाहा", "हे हे", "उफ़", "आह", "ओह", "अरे", "बाप रे", "वाह", "ओहो", "इश"]
+EXPRESSIONS = ["haha", "hahaha", "oh", "oh no", "ugh", "wow", "whoa", "aw", "yikes", "phew"]
 
-DEFAULT_SURFACE = {FC_BACKCHANNEL: "हाँ", FC_THINK: "हम्म"}
+DEFAULT_SURFACE = {FC_BACKCHANNEL: "yeah", FC_THINK: "hmm"}
 
 
 class FloorControlHead(nn.Module):

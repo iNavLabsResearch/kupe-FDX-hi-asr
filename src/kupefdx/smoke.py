@@ -20,8 +20,8 @@ from .model import KupeFDXModel
 from .quantizer import KMeansQuantizer
 from .stream import StreamingSession
 
-HINDI = ["नमस्ते आप कैसे हैं", "मुझे दवा चाहिए", "यह तकनीकी समस्या है",
-         "धन्यवाद आपका दिन शुभ हो", "कृपया थोड़ी मदद करें", "मेरा नाम राहुल है"]
+HINDI = ["hello how are you today", "i need some help please", "this is a technical issue",
+         "thank you have a good day", "my name is alex", "can you hear me clearly"]
 
 
 def make_synthetic(root: str, n_train=12, n_val=4, n_test=4, seconds=1.2) -> str:

@@ -25,11 +25,11 @@ _INTENT = {
     "nothing_happens":     "ordinary speech, no control token at all (pure ASR)",
     "clean_end_of_speech": "user clearly finishes a COMPLETE thought -> <EOS_SPEECH> at the end",
     "midsentence_pause":   "TRAP: a real pause mid-utterance that is NOT turn-end -> NO flag",
-    "backchannel":         "long user turn; a natural micro-pause for a short <BC> ack (हाँ/अच्छा/हूँ/जी)",
-    "expression":          "emotional reaction as <BC> with an expressive surface (हाहाहा/उफ़/ओह/वाह) — ONLY when context is funny/surprising/sad",
-    "thinking_sound":      "AFTER the user turn ends; system composing -> <EOS_SPEECH> then <THINK> (हम्म/उम्म)",
+    "backchannel":         "long user turn; a natural micro-pause for a short <BC> ack (yeah/right/okay/mhm)",
+    "expression":          "emotional reaction as <BC> with an expressive surface (haha/ugh/oh no/wow) — ONLY when context is funny/surprising/sad",
+    "thinking_sound":      "AFTER the user turn ends; system composing -> <EOS_SPEECH> then <THINK> (hmm/um)",
     "sustained_silence":   "no/low speech for a stretch -> <SILENCE> (NOT end-of-speech)",
-    "false_trigger_trap":  "filler/hesitation/breath (उम्म, आ...) -> NO flag despite a gap",
+    "false_trigger_trap":  "filler/hesitation/breath (um, uh, ahh...) -> NO flag despite a gap",
     "barge_in":            "user resumes right after a pause -> pause gets NO flag",
 }
 SCENARIOS = {k: (DEFAULT_WEIGHTS[k], _INTENT[k]) for k in DEFAULT_WEIGHTS}
@@ -48,16 +48,16 @@ RULES = """\
 FLAGS (mutually exclusive; at most ONE per pause; NEVER on a speech segment):
   <EOS_SPEECH>  user turn genuinely finished (semantic completeness + a real trailing pause).
   <BC>          short listener acknowledgment WHILE the user is still speaking, at a natural
-                micro-pause; MUST be followed by a surface word (हाँ / अच्छा / हूँ / जी).
+                micro-pause; MUST be followed by a surface word (yeah / right / okay / mhm).
   <THINK>       filler while the SYSTEM composes a reply — only AFTER an <EOS_SPEECH>; MUST be
-                followed by a surface sound (हम्म / अच्छा / देखिए).
+                followed by a surface sound (hmm / um / let me see).
   <SILENCE>     a sustained low-speech stretch that is NOT a turn boundary.
 Absence of any flag == "nothing happens". Use it generously.
 
-SURFACE INVENTORY (Devanagari; pick what fits the moment, add close variants as needed):
-  acknowledge: हाँ, हूँ, जी, जी हाँ, अच्छा, ठीक, ठीक है, बिलकुल, सही, ओके
-  emotional  : हाहाहा (laughter), हे हे, उफ़ (sigh/ughh), आह, ओह, अरे, अरे वाह, वाह, बाप रे, ओहो
-  thinking   : हम्म, हम्म्म, उम्म, आह, देखिए, एक मिनट, ज़रा रुकिए, सोचने दीजिए
+SURFACE INVENTORY (natural English; pick what fits the moment, add close variants as needed):
+  acknowledge: yeah, yes, right, okay, sure, got it, mhm, uh-huh, i see, exactly
+  emotional  : haha (laughter), oh, oh no, ugh (sigh), wow, whoa, aw, yikes, phew
+  thinking   : hmm, um, uh, let me see, let me think, one sec, well, okay so
 
 HARD CONSTRAINTS (semantic correctness — do NOT force a flag that the text/context does not justify):
 - Every flag must MAKE SENSE for this transcript and context. If unsure, use NO flag. Never
@@ -67,15 +67,13 @@ HARD CONSTRAINTS (semantic correctness — do NOT force a flag that the text/con
   LAST event of the turn.
 - <BC> only mid-turn and only after some speech has occurred (never as the first segment);
   it must fit as a listener reaction to what was just said.
-- Emotional expressions (हाहाहा, उफ़, ओह...) only when the context genuinely warrants it
+- Emotional expressions (haha, ugh, oh no...) only when the context genuinely warrants it
   (something funny, surprising, or sad) — never randomly.
 - <THINK> only AFTER an <EOS_SPEECH> in the same row (system is now composing a reply).
 - Ground every row in the given audio card: place pauses at plausible times from its pause
   list; do not invent pauses that contradict it.
-- DEVANAGARI ONLY for Hindi: write हिंदी, not "hindi"; कैसे हो, not "kaise ho". NEVER romanize
-  Hindi words. Use the clip transcript AS GIVEN (it is already Devanagari) — do not rewrite or
-  translate it; you only choose where flags go and the surface words. Surfaces in Devanagari.
-  (English is allowed ONLY for genuine English tech/proper terms, e.g. BP, RAM, server.)
+- ENGLISH: use the clip transcript AS GIVEN — do not rewrite or translate it; you only choose
+  where flags go and the surface words. Keep surfaces natural spoken English.
 - Keep surface words short and natural.
 - timeline t_s must be non-decreasing and within [0, duration]."""
 

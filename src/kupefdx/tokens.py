@@ -46,8 +46,8 @@ class TinyTokenizer:
     """Char-level tokenizer over the Devanagari CTC charset for the smoke path.
     Mirrors the HF tokenizer surface KupeFDX relies on."""
 
-    def __init__(self):
-        chars = CharTokenizer().chars
+    def __init__(self, lang: str = "en"):
+        chars = CharTokenizer(lang=lang).chars
         self.eos_token_id = 0
         self.bos_token_id = 1
         self.pad_token_id = 2

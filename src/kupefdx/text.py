@@ -22,14 +22,18 @@ _PUNCT_MAP = {"“": '"', "”": '"', "’": "'", "‘": "'", "—": "-", "–":
 
 
 def normalize(text: str, *, keep_punct: bool = True) -> str:
+    """Bilingual (English + Hindi) normalization used for both training targets and WER
+    scoring. Lowercase (no-op for Devanagari), map fancy punctuation, then keep only
+    letters/digits, apostrophe, space and the Hindi danda. Fair because ref and hyp are
+    normalized identically."""
     if text is None:
         return ""
     t = unicodedata.normalize("NFC", str(text))
     t = t.translate(_ZW_STRIP)
     for a, b in _PUNCT_MAP.items():
         t = t.replace(a, b)
-    if not keep_punct:
-        t = re.sub(r"[।?!,.\-]", " ", t)
+    t = t.lower()
+    t = "".join(c if (c.isalnum() or c in " '।") else " " for c in t)
     t = re.sub(r"\s+", " ", t).strip()
     return t
 
@@ -43,19 +47,20 @@ def devanagari_ratio(text: str) -> float:
     return dev / tot if tot else 1.0
 
 
-def ctc_charset(extra: str = "") -> list[str]:
-    """Ordered CTC symbol list; index 0 is reserved for the CTC blank in ctc_head.
-    Includes Devanagari letters + digits + space + a few punctuation marks."""
-    base = sorted({c for c in (_DEVANAGARI + " ।-" + extra)
-                   if unicodedata.category(c)[0] in ("L", "M", "N") or c in " ।-"})
-    return base
+def ctc_charset(lang: str = "en") -> list[str]:
+    """Ordered CTC symbol list; index 0 is the CTC blank (owned by ctc_head).
+    English: a-z + apostrophe + space. Hindi: Devanagari letters/marks + space + danda."""
+    if lang == "en":
+        return list("abcdefghijklmnopqrstuvwxyz'") + [" "]
+    return sorted({c for c in (_DEVANAGARI + " ।")
+                   if unicodedata.category(c)[0] in ("L", "M", "N") or c in " ।"})
 
 
 class CharTokenizer:
     """Char <-> id for the CTC head. id 0 == blank (owned by the CTC loss)."""
 
-    def __init__(self, charset: list[str] | None = None):
-        self.chars = charset or ctc_charset()
+    def __init__(self, charset: list[str] | None = None, lang: str = "en"):
+        self.chars = charset or ctc_charset(lang)
         self.blank = 0
         self.stoi = {c: i + 1 for i, c in enumerate(self.chars)}   # +1: 0 is blank
         self.itos = {i + 1: c for i, c in enumerate(self.chars)}

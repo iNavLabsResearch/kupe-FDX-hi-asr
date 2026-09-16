@@ -154,7 +154,7 @@ def load_decoder(cfg, dtype=torch.float32):
                  dec.config.vocab_size)
         return dec, tok
     from .tokens import TinyTokenizer
-    tok = TinyTokenizer()
+    tok = TinyTokenizer(lang=getattr(cfg, "lang", "en"))
     dec = TinyNandi(vocab=len(tok),
                     hidden=int(getattr(cfg.base, "tiny_hidden", 64)),
                     rank=int(getattr(cfg.base, "tiny_rank", 16)),

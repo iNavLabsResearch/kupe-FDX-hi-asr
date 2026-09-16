@@ -36,7 +36,7 @@ def _llm_cfg():
 
 
 SYSTEM = (
-    "You are a meticulous data engineer building Hindi voice-agent floor-control training "
+    "You are a meticulous data engineer building English voice-agent floor-control training "
     "data. You output ONLY a JSON array of rows, no prose. Each row grounds its timeline in "
     "the provided audio card. You follow the flag rules exactly and keep the scenario mix.")
 
@@ -52,7 +52,7 @@ def build_user_prompt(batch: list[dict], n_rows: int, scen_hint: list[str]) -> s
         f"{RULES}\n\n"
         f"AUDIO CARDS (ground every row in one of these clips via source_clip):\n{cards}\n\n"
         f"Produce EXACTLY {n_rows} rows as a JSON array. Row schema:\n{schema}\n"
-        f"`context` = 0-3 short prior conversation turns in DEVANAGARI that make the scenario "
+        f"`context` = 0-3 short prior conversation turns in natural English that make the scenario "
         f"natural — e.g. an Agent question before a user turn, so <EOS_SPEECH> / <BC> placement "
         f"is justified by the dialogue. Aim for this scenario mix: {scen_hint}.\n"
         f"TOKEN SAVING: keep each row's `transcript` EXACTLY the clip transcript (do not rewrite "
@@ -101,17 +101,17 @@ def _mock_rows(batch: list[dict], n_rows: int) -> list[dict]:
     out = []
     for k, s in enumerate(scen):
         clip = batch[k % len(batch)]
-        t = clip["transcript"] or "नमस्ते आप कैसे हैं"
+        t = clip["transcript"] or "hello how are you today"
         words = t.split()
         mid = max(1, len(words) // 2)
         row = blank_row(f"{clip['id']}_fc{k:03d}", clip["domain"], s, t)
         # a short prior-turn context that makes the scenario natural
         ctx_by_scen = {
-            "clean_end_of_speech": ["Agent: आपकी क्या समस्या है?"],
-            "backchannel": ["Agent: अपनी बात बताइए"],
-            "thinking_sound": ["Agent: ठीक है, बताइए"],
-            "midsentence_pause": ["Agent: हाँ जी बोलिए"],
-            "false_trigger_trap": ["Agent: कृपया बताइए"],
+            "clean_end_of_speech": ["Agent: what seems to be the problem?"],
+            "backchannel": ["Agent: go ahead, tell me"],
+            "thinking_sound": ["Agent: okay, tell me"],
+            "midsentence_pause": ["Agent: yes, go on"],
+            "false_trigger_trap": ["Agent: please tell me"],
         }
         row["context"] = ctx_by_scen.get(s, [])
         tl = [{"kind": "speech", "t_s": 0.1, "text": " ".join(words[:mid])}]
@@ -129,20 +129,20 @@ def _mock_rows(batch: list[dict], n_rows: int) -> list[dict]:
         elif s == "expression":
             # mock stays context-safe (neutral surprise/concern); the real LLM picks laughter
             # vs sigh from actual context per the rules. This avoids absurd mock samples.
-            surf = ["ओह", "अरे", "अच्छा", "आह"][k % 4]
-            row["context"] = ["Agent: अच्छा, फिर क्या हुआ?"]
+            surf = ["oh", "oh no", "wow", "whoa"][k % 4]
+            row["context"] = ["Agent: oh, and then what happened?"]
             tl += [{"kind": "pause", "t_s": 1.0, "dur_s": 0.3, "flag": "<BC>", "surface": surf},
                    {"kind": "speech", "t_s": 1.4, "text": " ".join(words[mid:])}]
         elif s == "thinking_sound":
             tl += [{"kind": "speech", "t_s": 1.0, "text": " ".join(words[mid:])},
                    {"kind": "pause", "t_s": 2.4, "dur_s": 0.5, "flag": "<EOS_SPEECH>"},
-                   {"kind": "pause", "t_s": 3.0, "dur_s": 0.7, "flag": "<THINK>", "surface": "हम्म"}]
+                   {"kind": "pause", "t_s": 3.0, "dur_s": 0.7, "flag": "<THINK>", "surface": "hmm"}]
         elif s == "sustained_silence":
             tl = [{"kind": "speech", "t_s": 0.1, "text": t},
                   {"kind": "pause", "t_s": 2.0, "dur_s": 1.5, "flag": "<SILENCE>"}]
         else:  # nothing_happens / false_trigger_trap / barge_in -> no flag
             if s == "false_trigger_trap":
-                tl = [{"kind": "speech", "t_s": 0.1, "text": "उम्म"},
+                tl = [{"kind": "speech", "t_s": 0.1, "text": "um"},
                       {"kind": "pause", "t_s": 0.6, "dur_s": 0.4},
                       {"kind": "speech", "t_s": 1.0, "text": t}]
             else:

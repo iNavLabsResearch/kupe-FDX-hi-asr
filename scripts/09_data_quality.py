@@ -52,6 +52,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--manifest", required=True)
     ap.add_argument("--kind", default="fc", choices=["fc", "domain"])
+    ap.add_argument("--lang", default="en", help="en skips the Devanagari-purity check")
     a = ap.parse_args()
     rows = read_manifest(a.manifest)
     n = len(rows)
@@ -80,11 +81,12 @@ def main():
                 flags[f] += 1
         if not rflags:
             noflag += 1
-        # devanagari purity
-        dr = _dev_of_row(r)
-        dev_ratios.append(dr)
-        if dr < DEV_MIN:
-            romanized += 1
+        # devanagari purity (Hindi only; English is Latin so skip)
+        if a.lang == "hi":
+            dr = _dev_of_row(r)
+            dev_ratios.append(dr)
+            if dr < DEV_MIN:
+                romanized += 1
         # audio + duplicates
         if r.get("audio") and not os.path.isfile(r["audio"]):
             no_audio += 1
@@ -116,8 +118,9 @@ def main():
                  f, c, 100 * c / n, 100 * c / total_flags)
     log.info("   no-flag rows      %5d   (%.1f%%)", noflag, 100 * noflag / n)
     log.info("domains: %s", dict(dom))
-    log.info("Devanagari ratio: mean=%.3f  rows<%.2f (romanized)=%d (%.1f%%)",
-             sum(dev_ratios) / n, DEV_MIN, romanized, 100 * romanized / n)
+    if a.lang == "hi":
+        log.info("Devanagari ratio: mean=%.3f  rows<%.2f (romanized)=%d (%.1f%%)",
+                 sum(dev_ratios) / max(len(dev_ratios), 1), DEV_MIN, romanized, 100 * romanized / n)
     log.info("invalid(schema/semantic)=%d  duplicates=%d  missing-audio=%d  bad-duration=%d",
              len(invalid), dups, no_audio, bad_dur)
     for rid, why in invalid[:8]:

@@ -1,0 +1,93 @@
+# ENGLISH config — FastConformer encoder (NVIDIA) + Nandi-Mini-150M, tuned for a 4090 (24GB).
+# The whole project pivoted to English: encoder = stt_en_fastconformer_hybrid_large_pc (we use
+# ONLY its encoder; our own CTC head is trained fresh). Target: ~3% WER on clean English.
+project: kupe-fdx-en-asr
+seed: 1337
+owner: anuj-inavlabs
+backend: real
+lang: en
+
+repos:
+  data: "{owner}/kupe-en-asr-data"
+  runs: "{owner}/KupeFDX-en-asr-runs"
+  model: "{owner}/KupeFDX-en-asr"
+
+paths:
+  data_dir: data
+  runs_dir: checkpoints
+  ledger_dir: data/manifests
+  feats_dir: data/encoded/feats
+  raw_dir: data/raw
+
+base:
+  encoder_type: fastconformer
+  encoder_id: nvidia/stt_en_fastconformer_hybrid_large_pc   # NeMo pulls from NGC/HF
+  decoder_id: FrontiersMind/Nandi-Mini-150M
+  trust_remote_code: true
+  attn_impl: sdpa
+  dtype: bfloat16
+
+audio:
+  projector: mlp
+  proj_dropout: 0.1
+  n_codes: 0             # continuous soft-prompts (recommended). >0 adds discrete audio tokens.
+  # FastConformer = 12.5 fps (80 ms/frame). 8 frames = 640 ms streaming chunk.
+  chunk_frames: 8
+  left_chunks: 4         # ~3.2 s past context (free, no latency)
+  right_chunks: 0        # pure causal (lowest latency); set 1 to trade latency for WER
+
+model:
+  max_audio_frames: 1500
+  max_text_tokens: 256
+
+data:
+  manifest: data/manifests/train.jsonl
+  max_dur: 30.0
+  min_hours: 500         # refuse the main run on too little data
+  use_cached_feats: true
+
+train:
+  epochs: 3
+  batch_size: 8          # 4090 24GB, bf16
+  grad_accum: 4          # effective batch 32
+  lr: 0.0001
+  weight_decay: 0.01
+  warmup_ratio: 0.03
+  max_grad_norm: 1.0
+  bf16: true
+  num_workers: 8
+  logging_steps: 25
+  eval_steps: 1000
+  save_steps: 1000
+  fc_weight: 3.0
+  eos_lead_ms: 160
+  push_to_hub: true
+
+fc:
+  distribution:
+    nothing_happens: 20
+    clean_end_of_speech: 15
+    midsentence_pause: 12
+    backchannel: 18
+    expression: 8
+    thinking_sound: 8
+    sustained_silence: 6
+    false_trigger_trap: 8
+    barge_in: 5
+
+stream:
+  chunk_ms: 80
+  endpoint_mode: predictive
+  emit_ctc_draft: false
+  temperature: 1.0
+  thresholds: {"<BC>": 0.40, "<THINK>": 0.50, "<EOS_SPEECH>": 0.55, "<SILENCE>": 0.60}
+  biases:     {"<BC>": 0.0,  "<THINK>": 0.0,  "<EOS_SPEECH>": 0.0,  "<SILENCE>": 0.0}
+  min_gaps:   {"<BC>": 2,    "<THINK>": 3,    "<EOS_SPEECH>": 0,    "<SILENCE>": 4}
+
+eval:
+  subset_samples: 200
+  max_samples: 2000
+  max_new_tokens: 256
+  batch_size: 16
+  wer_pass: 0.03         # 3% target on clean English
+  wer_broken: 0.80

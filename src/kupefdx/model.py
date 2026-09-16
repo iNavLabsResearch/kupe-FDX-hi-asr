@@ -63,7 +63,8 @@ class KupeFDXModel(nn.Module):
         dtype = _DTYPES.get(getattr(cfg.base, "dtype", "float32"), torch.float32)
         encoder = build_encoder(cfg, dtype)
         decoder, tok = load_decoder(cfg, dtype)
-        char_tok = CharTokenizer()
+        lang = getattr(cfg, "lang", "en")
+        char_tok = CharTokenizer(lang=lang)
         n_codes = int(getattr(cfg.audio, "n_codes", 0))
 
         specials = build_special_tokens(n_codes)

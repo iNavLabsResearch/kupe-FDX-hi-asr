@@ -224,9 +224,11 @@ class FastConformerEncoder(nn.Module):
     It also has NATIVE cache-aware streaming (0/80/480/1040 ms) so we do not retrofit
     causality. Interface identical to the other encoders."""
 
-    def __init__(self, model, out_dim, frame_rate, hop_samples, chunk_frames, left_chunks):
+    def __init__(self, preprocessor, encoder, out_dim, frame_rate, hop_samples,
+                 chunk_frames, left_chunks):
         super().__init__()
-        self.model = model
+        self.pre = preprocessor          # AudioToMelSpectrogramPreprocessor
+        self.model = encoder             # ConformerEncoder
         self.out_dim = int(out_dim)
         self.frame_rate = float(frame_rate)
         self.hop_samples = int(hop_samples)
@@ -235,23 +237,25 @@ class FastConformerEncoder(nn.Module):
 
     @classmethod
     def load(cls, model_id, chunk_frames, left_chunks, dtype=torch.float32):
-        # Loaded via NeMo on the GPU box (nemo.collections.asr). FastConformer subsamples
-        # 10 ms mel frames x8 -> 80 ms/frame = 12.5 fps; d_model discovered at runtime.
+        # NeMo pulls the .nemo from NGC/HF. stt_en_fastconformer_hybrid_large_pc:
+        # 10 ms mel frames x8 subsampling -> 80 ms/frame = 12.5 fps; d_model = 512.
         import nemo.collections.asr as nemo_asr
         m = nemo_asr.models.ASRModel.from_pretrained(model_id)
-        enc = m.encoder
         d_model = int(getattr(m.cfg.encoder, "d_model", 512))
         hop = int(SAMPLE_RATE * 0.08)             # 80 ms/frame
-        # set cache-aware streaming context on the encoder here (att_context_size) per latency.
-        return cls(enc, d_model, SAMPLE_RATE / hop, hop, chunk_frames, left_chunks)
+        log.info("loaded FastConformer encoder (%s) | d_model=%d | 12.5 fps | CTC head is OURS",
+                 model_id, d_model)
+        return cls(m.preprocessor, m.encoder, d_model, SAMPLE_RATE / hop, hop,
+                   chunk_frames, left_chunks)
 
     def _flen(self, wave_len):
         return torch.clamp(torch.div(wave_len, self.hop_samples, rounding_mode="floor"), min=1)
 
     def features(self, wave, wave_len):
-        # NeMo encoders take a mel spectrogram; the preprocessor is threaded on the GPU box.
-        feats = self.model(audio_signal=wave, length=wave_len)[0].transpose(1, 2)
-        return feats, self._flen(wave_len)
+        # raw wave -> mel (preprocessor) -> encoder. Encoder returns [B, D, T]; -> [B, T, D].
+        proc, proc_len = self.pre(input_signal=wave, length=wave_len)
+        enc_out, enc_len = self.model(audio_signal=proc, length=proc_len)
+        return enc_out.transpose(1, 2), enc_len
 
 
 def build_encoder(cfg, dtype=torch.float32) -> nn.Module:
@@ -259,10 +263,16 @@ def build_encoder(cfg, dtype=torch.float32) -> nn.Module:
     chunk = int(getattr(ac, "chunk_frames", 8))
     left = int(getattr(ac, "left_chunks", 1))
     if cfg.backend == "real":
-        etype = getattr(cfg.base, "encoder_type", "fastconformer")
+        etype = getattr(cfg.base, "encoder_type", "hf_w2v2")
         if etype in ("fastconformer", "indicconformer"):
             return FastConformerEncoder.load(cfg.base.encoder_id, chunk, left, dtype)
-        return OmniW2VEncoder.load(cfg.base.encoder_id, chunk, left, dtype)  # omni_w2v
+        if etype in ("hf_w2v2", "wav2vec2"):        # English: standard HF wav2vec2 SSL — loads clean
+            from transformers import AutoModel
+            m = AutoModel.from_pretrained(cfg.base.encoder_id).to(dtype)
+            out_dim = int(m.config.hidden_size)
+            log.info("loaded HF wav2vec2 SSL encoder (%s) | out_dim=%d | 50 fps", cfg.base.encoder_id, out_dim)
+            return OmniW2VEncoder(m, out_dim, SAMPLE_RATE / 320, 320, chunk, left, "hf-w2v2")
+        return OmniW2VEncoder.load(cfg.base.encoder_id, chunk, left, dtype)  # omni_w2v (package)
     enc = TinyEncoder(out_dim=int(getattr(ac, "tiny_enc_dim", 64)),
                       layers=int(getattr(ac, "tiny_enc_layers", 2)),
                       chunk_frames=chunk, left_chunks=left,

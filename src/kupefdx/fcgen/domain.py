@@ -23,22 +23,20 @@ from ..env import log
 from ..text import normalize
 from .agent import _llm_cfg, call_llm, tqdm
 
-# Devanagari term maps for the offline mock (raw ASR term -> corrected domain term).
-# Real coverage comes from the LLM. Hindi stays in Devanagari; genuine English terms (BP, RAM)
-# are allowed as English.
+# English term maps for the offline mock (raw ASR term -> corrected domain term).
+# Real coverage comes from the LLM.
 MOCK_TERMS = {
-    "medical": [("शुगर", "रक्त शर्करा"), ("बीपी", "रक्तचाप"), ("डाइबिटीज़", "मधुमेह"),
-                ("दिल की धड़कन तेज़", "क्षिप्रहृदयता")],
-    "technical": [("सर्वर गिर गया", "सर्वर बंद हो गया"), ("डेटा भेजो", "डेटा ट्रांसफ़र करो"),
-                  ("रैम मेमोरी", "रैम")],
-    "banking": [("पैसा भेजो", "राशि स्थानांतरित करें"), ("खाता नंबर", "खाता संख्या")],
-    "general": [("अच्छा जी", "अच्छा")],
+    "medical": [("high blood pressure", "hypertension"), ("sugar", "blood glucose"),
+                ("diabetees", "diabetes"), ("heart beating fast", "tachycardia")],
+    "technical": [("server went down", "server is down"), ("send the data", "transfer the data"),
+                  ("ram memory", "RAM")],
+    "banking": [("send money", "transfer funds"), ("account no", "account number")],
+    "general": [("okay so", "okay")],
 }
 
-SYSTEM = ("You correct Hindi ASR transcripts for a given domain. Fix domain terminology and "
-          "obvious ASR errors using the conversation context. Hindi MUST be in Devanagari — "
-          "never romanize (write मधुमेह, not 'madhumeh'); genuine English terms (BP, RAM) may "
-          "stay English. Output ONLY a JSON array of records. Never change meaning.")
+SYSTEM = ("You correct English ASR transcripts for a given domain. Fix domain terminology and "
+          "obvious ASR errors using the conversation context. Output ONLY a JSON array of "
+          "records. Never change meaning.")
 
 
 def validate_record(rec: dict) -> dict:
