@@ -81,29 +81,30 @@ def shard_stream(a):
             ds = load_dataset(ds_id, cfg_name, split=split, streaming=True, trust_remote_code=True)
         except TypeError:
             ds = load_dataset(ds_id, cfg_name, split=split, streaming=True)
-        it = iter(ds)
-        si = 0
-        while True:
-            batch = list(itertools.islice(it, a.shard_size))
-            if not batch:
-                break
-            rows = []
-            for j, ex in enumerate(batch):
-                text = normalize(ex[tcol])
-                arr = np.asarray(ex[acol]["array"], dtype="float32")
-                sr = ex[acol]["sampling_rate"]
-                if sr != SAMPLE_RATE:
-                    arr = _resample(arr, sr, SAMPLE_RATE)
-                dur = len(arr) / SAMPLE_RATE
-                if not _keep(text, dur):
-                    continue
-                cid = f"{a.hf}_{si:04d}_{j:04d}"
-                p = os.path.join(raw_dir, cid + ".wav")
-                save_wav(p, arr)
-                rows.append({"id": cid, "audio": p, "text": text, "dur": dur,
-                             "domain": a.domain, "split": _split_of(cid)})
+        log.info("streaming %s (first shard downloads the archive — hold on)...", a.hf)
+        rows, si, j = [], 0, 0
+        for ex in ds:                              # incremental: save + log each clip as it arrives
+            text = normalize(ex[tcol])
+            arr = np.asarray(ex[acol]["array"], dtype="float32")
+            sr = ex[acol]["sampling_rate"]
+            if sr != SAMPLE_RATE:
+                arr = _resample(arr, sr, SAMPLE_RATE)
+            dur = len(arr) / SAMPLE_RATE
+            j += 1
+            if not _keep(text, dur):
+                continue
+            cid = f"{a.hf}_{si:04d}_{j:06d}"
+            p = os.path.join(raw_dir, cid + ".wav")
+            save_wav(p, arr)
+            rows.append({"id": cid, "audio": p, "text": text, "dur": dur,
+                         "domain": a.domain, "split": _split_of(cid)})
+            if len(rows) % 25 == 0:
+                log.info("  ...collected %d clips for shard %d", len(rows), si)
+            if len(rows) >= a.shard_size:
+                yield si, rows
+                rows, si = [], si + 1
+        if rows:
             yield si, rows
-            si += 1
 
 
 def main():
