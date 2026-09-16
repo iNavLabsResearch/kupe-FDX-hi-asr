@@ -10,7 +10,10 @@ cd "$(dirname "$0")/.."
 CFG=${CFG:-configs/en.yaml}
 SHARD=${SHARD:-500}
 RAW_ONLY=${RAW_ONLY:-1}
-EXTRA=""; [ "$RAW_ONLY" = "1" ] && EXTRA="--raw-only"
+NO_FLUSH=${NO_FLUSH:-0}          # 1 = keep raw+encoded on local disk (single-box training)
+EXTRA=""
+[ "$RAW_ONLY" = "1" ] && EXTRA="$EXTRA --raw-only"
+[ "$NO_FLUSH" = "1" ] && EXTRA="$EXTRA --no-flush"
 
 # id | config | split | domain     (columns auto-detected; --split matters for LibriSpeech)
 DATASETS=(
