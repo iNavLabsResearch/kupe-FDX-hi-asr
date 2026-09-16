@@ -114,6 +114,8 @@ def main():
     ap.add_argument("--shard-start", type=int, default=0, help="process shards where idx%%stride==shard-start")
     ap.add_argument("--stride", type=int, default=1)
     ap.add_argument("--no-flush", action="store_true", help="keep local shard files (debug)")
+    ap.add_argument("--raw-only", action="store_true",
+                    help="download + push RAW audio only (skip the encoder); encode later")
     a = ap.parse_args()
     cfg = a_cfg = load_config(a.config)
     if not a.hf and not a.local_dir:
@@ -122,8 +124,8 @@ def main():
     hf_login()
     ensure_repo(cfg.repos.data, "dataset")
 
-    enc = build_encoder(cfg).to(dev).eval()
-    n_codes = int(getattr(cfg.audio, "n_codes", 0))
+    enc = None if a.raw_only else build_encoder(cfg).to(dev).eval()
+    n_codes = 0 if a.raw_only else int(getattr(cfg.audio, "n_codes", 0))
     qpath = os.path.join(cfg.paths.data_dir, "encoded", "quantizer.pt")
     os.makedirs(os.path.dirname(qpath), exist_ok=True)
     quant = KMeansQuantizer.load(qpath) if (n_codes > 0 and os.path.isfile(qpath)) else None
@@ -152,31 +154,32 @@ def main():
         os.makedirs(work, exist_ok=True)
         try:
             # 1) encode feats (+ fit quantizer on the very first shard if codes enabled)
-            for r in rows:
+            if not a.raw_only:
+              for r in rows:
                 f = feats_of(r["audio"])
                 np.save(os.path.join(work, r["id"] + ".feats.npy"), f.astype(np.float16))
                 r["feats"] = f"shards/{sid}/{r['id']}.feats.npy"
-            if n_codes > 0 and quant is None:
+            if not a.raw_only and n_codes > 0 and quant is None:
                 pool = np.concatenate([np.load(os.path.join(work, r["id"] + ".feats.npy")).astype(np.float32)
                                        for r in rows[:64]], 0)
                 quant = KMeansQuantizer.fit(pool, n_codes, iters=25)
                 quant.save(qpath)
                 upload_file(qpath, cfg.repos.data, "dataset", "encoded/quantizer.pt", "quantizer")
                 log.info("fitted + pushed quantizer (%d codes)", n_codes)
-            if n_codes > 0:
+            if not a.raw_only and n_codes > 0:
                 for r in rows:
                     f = np.load(os.path.join(work, r["id"] + ".feats.npy")).astype(np.float32)
                     np.save(os.path.join(work, r["id"] + ".codes.npy"), quant.encode(f).astype(np.int64))
                     r["codes"] = f"shards/{sid}/{r['id']}.codes.npy"
             # 2) shard manifest
             write_manifest(os.path.join(work, "manifest.jsonl"), rows)
-            # 3) push RAW + ENCODED for this shard
-            raw_paths = [r["audio"] for r in rows]
-            for p in raw_paths:                     # raw wavs
-                upload_file(p, cfg.repos.data, "dataset", f"raw/{sid}/{os.path.basename(p)}",
-                            f"raw {sid}")
-            upload_folder(work, cfg.repos.data, "dataset", path_in_repo=f"encoded/{sid}",
-                          commit_message=f"encoded {sid}")
+            # 3) push RAW (always) + ENCODED (unless raw-only)
+            for r in rows:                          # raw wavs
+                upload_file(r["audio"], cfg.repos.data, "dataset",
+                            f"raw/{sid}/{os.path.basename(r['audio'])}", f"raw {sid}")
+            sub = "manifests" if a.raw_only else "encoded"
+            upload_folder(work, cfg.repos.data, "dataset", path_in_repo=f"{sub}/{sid}",
+                          commit_message=f"{sub} {sid}")
             # 4) ledger + hours
             sh = sum(r["dur"] for r in rows) / 3600
             total_h += sh
