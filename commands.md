@@ -69,15 +69,22 @@ This is the correct disk-light flow: raw and encoded land on the Hub **continuou
 disk never fills, and it's resumable per shard. Target ≈**3,200 h** total (see §Hours below).
 
 ```bash
-# one box, all shards (500 clips/shard):
-python scripts/11_shard_pipeline.py --config configs/gpu.yaml --hf fleurs_hi        --shard-size 500
-python scripts/11_shard_pipeline.py --config configs/gpu.yaml --hf common_voice_hi  --shard-size 500
-# (OPTIONAL) your own local audio, tagged by domain — skip if you have none:
+# ONE script for every Hindi HF source (FLEURS, Common Voice, Shrutilipi, IndicVoices,
+# Kathbath). Continues on error. Auto-detects audio/text columns. Default = download→encode→push.
+bash scripts/gather_all.sh
+# RAW_ONLY=1 bash scripts/gather_all.sh                    # skip encoder (raw push only)
+# ONLY=fleurs_hi,shrutilipi_hi bash scripts/gather_all.sh  # subset
+
+# or one source by hand:
+python scripts/11_shard_pipeline.py --config configs/gpu.yaml --hf fleurs_hi --shard-size 500
+# any HF dataset (columns auto-detected):
+# python scripts/11_shard_pipeline.py --config configs/gpu.yaml --hf-id ai4bharat/Shrutilipi --hf-config hindi --domain news --shard-size 500
+# (OPTIONAL) local <name>.wav + <name>.txt pairs:
 # python scripts/11_shard_pipeline.py --config configs/gpu.yaml --local-dir /data/hi_medical --domain medical --shard-size 500
 
 # PARALLEL across 2 GPUs (interleaved shards run "meanwhile"):
-CUDA_VISIBLE_DEVICES=0 python scripts/11_shard_pipeline.py --config configs/gpu.yaml --hf shrutilipi_hi --shard-size 500 --shard-start 0 --stride 2 &
-CUDA_VISIBLE_DEVICES=1 python scripts/11_shard_pipeline.py --config configs/gpu.yaml --hf shrutilipi_hi --shard-size 500 --shard-start 1 --stride 2 &
+CUDA_VISIBLE_DEVICES=0 python scripts/11_shard_pipeline.py --config configs/gpu.yaml --hf-id ai4bharat/Shrutilipi --hf-config hindi --shard-size 500 --shard-start 0 --stride 2 &
+CUDA_VISIBLE_DEVICES=1 python scripts/11_shard_pipeline.py --config configs/gpu.yaml --hf-id ai4bharat/Shrutilipi --hf-config hindi --shard-size 500 --shard-start 1 --stride 2 &
 wait
 ```
 Each shard pushes `raw/<shard>/*.wav` + `encoded/<shard>/*.npy` + manifest to

@@ -55,6 +55,27 @@ def _keep(text, dur):
     return 0.5 <= dur <= 30.0 and len(normalize(text)) >= 2
 
 
+def _detect_cols(ex, acol, tcol):
+    """Auto-find the audio + text columns from one example, so any ASR dataset works
+    without passing column names. Audio = a dict with array/sampling_rate/path; text =
+    a preferred name, else the first string field."""
+    if acol not in ex or not isinstance(ex.get(acol), dict):
+        for k, v in ex.items():
+            if isinstance(v, dict) and ({"array", "sampling_rate", "path"} & set(v)):
+                acol = k
+                break
+    if tcol not in ex or not isinstance(ex.get(tcol), str):
+        pref = ["transcript", "text", "sentence", "transcription", "normalized_text",
+                "raw_text", "clean_text", "transcription_v1", "transcription_v2"]
+        cand = [k for k in pref if isinstance(ex.get(k), str)] or \
+               [k for k, v in ex.items() if isinstance(v, str) and k != acol and len(v) > 1]
+        if cand:
+            tcol = cand[0]
+    if acol not in ex or tcol not in ex:
+        raise SystemExit(f"could not auto-detect audio/text columns; keys={list(ex.keys())}")
+    return acol, tcol
+
+
 def shard_stream(a):
     """Yield (shard_idx, [rows]) where rows have local wav paths already written."""
     raw_dir = os.path.join(a_cfg.paths.raw_dir, "wavs")
@@ -92,13 +113,26 @@ def shard_stream(a):
             total = None
         name = (a.hf or a.hf_id).replace("/", "_")
         log.info("streaming %s (first shard downloads the archive — hold on)...", name)
+        # peek one example → auto-detect columns → stitch it back so no clip is lost
+        it = iter(ds)
+        try:
+            first = next(it)
+        except StopIteration:
+            log.warning("%s is empty — nothing to stream", name)
+            return
+        acol, tcol = _detect_cols(first, acol, tcol)
+        log.info("columns: audio=%s text=%s", acol, tcol)
+        stream = itertools.chain([first], it)
         bar = tqdm(total=total, unit="clip", desc=name, dynamic_ncols=True)
         rows, si, j, kept_h = [], 0, 0, 0.0
-        for ex in ds:                              # incremental: save each clip as it arrives
+        for ex in stream:                          # incremental: save each clip as it arrives
             bar.update(1); j += 1
-            text = normalize(ex[tcol])
-            arr = np.asarray(ex[acol]["array"], dtype="float32")
-            sr = ex[acol]["sampling_rate"]
+            text = normalize(str(ex[tcol]))
+            aud = ex[acol]
+            if not isinstance(aud, dict) or "array" not in aud:
+                continue
+            arr = np.asarray(aud["array"], dtype="float32")
+            sr = aud["sampling_rate"]
             if sr != SAMPLE_RATE:
                 arr = _resample(arr, sr, SAMPLE_RATE)
             dur = len(arr) / SAMPLE_RATE
