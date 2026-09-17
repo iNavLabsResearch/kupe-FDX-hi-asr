@@ -36,8 +36,15 @@ DATASETS=(
 # NOTE: ai4bharat/Svarah (9.6 h Indian-English) is an EVAL benchmark — do NOT train on it;
 #       use it as a held-out Indian-accent test set for scripts/04_eval.py.
 
+# ONLY="id1 id2" runs just those sources (substring match) — use it to parallel-gather
+# the un-done sources without touching ones already complete under the old naming, e.g.:
+#   ONLY="peoples_speech gigaspeech voxpopuli" DL_WORKERS=4 bash scripts/gather_all_en.sh
 for entry in "${DATASETS[@]}"; do
   IFS='|' read -r ID CFGNAME SPLIT DOMAIN MAXH <<< "$entry"
+  if [ -n "${ONLY:-}" ]; then
+    keep=0; for tok in $ONLY; do case "$ID" in *"$tok"*) keep=1;; esac; done
+    [ "$keep" = "1" ] || { echo "-- skip $ID (not in ONLY)"; continue; }
+  fi
   echo "════════ $ID  [$CFGNAME / $SPLIT]  domain=$DOMAIN  max=${MAXH}h ════════"
   CFGFLAG=(--hf-config "$CFGNAME"); [ "$CFGNAME" = "-" ] && CFGFLAG=()
   python scripts/11_shard_pipeline.py --config "$CFG" \
