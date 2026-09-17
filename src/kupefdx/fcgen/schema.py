@@ -95,7 +95,32 @@ def validate_row(row: dict, *, fix: bool = True) -> dict:
     # flags actually present, for balancing / metrics
     row["flags"] = sorted({s["flag"] for s in row["timeline"] if s.get("flag") in FLAGS})
     row["transcript"] = normalize(row["transcript"])
+    _reconcile_scenario(row)                       # relabel so scenario ALWAYS matches the flags
     return row
+
+
+_NOFLAG_SCEN = {"nothing_happens", "midsentence_pause", "false_trigger_trap", "barge_in"}
+_EMO = ("haha", "oh no", "ugh", "wow", "whoa", "yikes", "phew", "aw", "hahaha")
+
+
+def _reconcile_scenario(row: dict) -> None:
+    """gpt-luna sometimes mislabels (e.g. 'clean_end_of_speech' with no <EOS_SPEECH> placed).
+    Set the scenario from the flags actually present, so the label never lies and the realized
+    distribution is honest."""
+    has = set(row.get("flags", []))
+    if FC_THINK in has:
+        s = "thinking_sound"
+    elif FC_EOS_SPEECH in has:
+        s = "clean_end_of_speech"
+    elif FC_BACKCHANNEL in has:
+        surf = " ".join(sg.get("surface", "") for sg in row["timeline"]
+                        if sg.get("flag") == FC_BACKCHANNEL).lower()
+        s = "expression" if any(w in surf for w in _EMO) else "backchannel"
+    elif FC_SILENCE in has:
+        s = "sustained_silence"
+    else:                                          # no flag: keep a specific no-flag label else default
+        s = row.get("scenario") if row.get("scenario") in _NOFLAG_SCEN else "nothing_happens"
+    row["scenario"] = s
 
 
 def blank_row(rid: str, domain: str, scenario: str, transcript: str) -> dict:
