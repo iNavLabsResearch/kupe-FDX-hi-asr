@@ -26,13 +26,14 @@ DATASETS=(
   "openslr/librispeech_asr|clean|train.100|read_us|0"          # ~100 h (already done → hub-sync skips)
   "openslr/librispeech_asr|clean|train.360|read_us|0"          # ~360 h
   "openslr/librispeech_asr|other|train.500|read_us|0"          # ~500 h
-  "MLCommons/peoples_speech|clean|train|spontaneous|${MAXH_SPONT:-500}"       # spontaneous
-  "speechcolab/gigaspeech|l|train|podcasts_audiobooks|${MAXH_PODCAST:-500}"   # podcasts (gated: accept)
+  "MLCommons/peoples_speech|clean|train|spontaneous|${MAXH_SPONT:-500}"       # spontaneous (done)
+  "parler-tts/mls_eng|-|train|read_audiobook|${MAXH_MLS:-1500}"               # MLS English (ungated, fast)
   "facebook/voxpopuli|en|train|accented|${MAXH_ACCENT:-500}"                  # accented English
 )
-# NOTE: ai4bharat/NPTEL is an En→Indic TRANSLATION dataset (configs en2indic/indic2en),
-#       NOT an ASR corpus — it has no training audio, so it was removed. For Indian-English
-#       pretraining audio we'd need a real speech corpus (Svarah is eval-only, 9.6 h).
+# ~4,000 h mix: LibriSpeech ~960 + People's Speech 500 + MLS English 1500 + VoxPopuli 500.
+# GigaSpeech dropped — its podcast segments are heavily filtered (kept_h≈0.5), so slow per kept
+# hour. MLS English (LibriVox, ~44k h available) streams clean and fast like LibriSpeech.
+# NOTE: ai4bharat/NPTEL is an En→Indic TRANSLATION dataset (no ASR audio) — removed.
 # NOTE: ai4bharat/Svarah (9.6 h Indian-English) is an EVAL benchmark — do NOT train on it;
 #       use it as a held-out Indian-accent test set for scripts/04_eval.py.
 
