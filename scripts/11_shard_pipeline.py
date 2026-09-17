@@ -289,6 +289,13 @@ def download_worker(a, cfg, src_name, led, dl_q: Queue, dl_bar: tqdm, err_box: l
                 continue
             cid = f"{src_name}_{si:04d}_{j:06d}"
             p = os.path.join(raw_root, cid + ".wav")
+            if a.min_free_gb:                       # disk backpressure: wait for uploads to drain
+                import shutil as _sh
+                waited = 0
+                while _sh.disk_usage(a_cfg.paths.data_dir).free / 2**30 < a.min_free_gb:
+                    if waited == 0:
+                        tqdm.write(f"disk < {a.min_free_gb}GB free — pausing download for uploads to flush")
+                    time.sleep(3); waited += 1
             save_wav(p, arr)
             rows.append({"id": cid, "audio": p, "text": text, "dur": dur,
                          "domain": a.domain, "split": _split_of(cid)})
@@ -405,6 +412,8 @@ def main():
     ap.add_argument("--shard-start", type=int, default=0)
     ap.add_argument("--stride", type=int, default=1)
     ap.add_argument("--no-flush", action="store_true")
+    ap.add_argument("--min-free-gb", type=float, default=0.0,
+                    help="pause downloading if local free disk drops below this (auto-backpressure)")
     ap.add_argument("--raw-only", action="store_true")
     ap.add_argument("--push-raw", action="store_true")
     ap.add_argument("--peek", action="store_true")

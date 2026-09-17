@@ -74,5 +74,5 @@ PHASE_FC = 4         # STAGE C: floor-control signals + heavy "nothing" negative
 PHASE_DOMAIN = 5     # STAGE C: domain-term correction
 
 STAGE_OF_PHASE = {1: "A", 2: "B", 3: "B", 4: "C", 5: "C"}
-STAGE_NAME = {"A": "adapt encoder on Hindi", "B": "teach Nandi to transcribe",
+STAGE_NAME = {"A": "warm up projector (encoder frozen)", "B": "teach Nandi to transcribe",
               "C": "floor-control + correction"}

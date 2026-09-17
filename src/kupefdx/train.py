@@ -33,18 +33,26 @@ def phase_setup(phase: int, cfg) -> dict:
     """Return loss weights + which modules train + encoder LR scale for a phase."""
     t = cfg.train
     # fc = inline-flag CE weight (LM); fcc = per-chunk head weight; fch = fc_head trains.
+    # RECIPE for a PRETRAINED ASR encoder (FastConformer): keep the encoder FROZEN and warm up
+    # the projector first, then add Nandi, then unfreeze the encoder at a tiny LR at the very
+    # end. This prevents random projector gradients from wrecking the good pretrained encoder.
+    # lr_scale multiplies cfg.train.lr for the phase; enc_lr scales the encoder param-group LR.
     table = {
-        PHASE_CTC:    dict(lm=0.0, ctc=1.0, fc=0.0, fcc=0.0, fch=False,
-                           enc=True,  c=True,  proj=False, dec=False, enc_lr=1.0),
-        PHASE_ALIGN:  dict(lm=1.0, ctc=0.3, fc=0.0, fcc=0.0, fch=False,
-                           enc=False, c=False, proj=True,  dec=True,  enc_lr=0.0),
-        # Phase 3 also trains the per-chunk head on the NOTHING baseline (ASR = all quiet).
-        PHASE_JOINT:  dict(lm=1.0, ctc=0.3, fc=0.0, fcc=0.2, fch=True,
-                           enc=True,  c=True,  proj=True,  dec=True,  enc_lr=0.1),
+        # Stage A/warmup: projector-only (encoder+Nandi FROZEN). CTC head (linear on frozen
+        # feats) also trains — cheap, gives blank-run timing. Projector LR ~1e-3.
+        PHASE_CTC:    dict(lm=1.0, ctc=0.3, fc=0.0, fcc=0.0, fch=False, lr_scale=10.0,
+                           enc=False, c=True,  proj=True,  dec=False, enc_lr=0.0),
+        # Stage B align: encoder FROZEN; projector + Nandi + CTC + FC head. LR ~1e-4.
+        PHASE_ALIGN:  dict(lm=1.0, ctc=0.3, fc=0.0, fcc=0.2, fch=True, lr_scale=1.0,
+                           enc=False, c=True,  proj=True,  dec=True,  enc_lr=0.0),
+        # Stage B joint / full fine-tune: unfreeze encoder at a TINY LR. Nandi ~2e-5, enc ~1e-5.
+        PHASE_JOINT:  dict(lm=1.0, ctc=0.3, fc=0.0, fcc=0.2, fch=True, lr_scale=0.2,
+                           enc=True,  c=True,  proj=True,  dec=True,  enc_lr=0.5),
+        # Stage C floor-control: encoder frozen again; Nandi+projector+FC at low LR.
         PHASE_FC:     dict(lm=1.0, ctc=0.1, fc=float(getattr(t, "fc_weight", 3.0)),
-                           fcc=float(getattr(t, "fc_chunk_weight", 1.0)), fch=True,
+                           fcc=float(getattr(t, "fc_chunk_weight", 1.0)), fch=True, lr_scale=0.3,
                            enc=False, c=False, proj=True, dec=True, enc_lr=0.0),
-        PHASE_DOMAIN: dict(lm=1.0, ctc=0.1, fc=1.0, fcc=0.0, fch=False,
+        PHASE_DOMAIN: dict(lm=1.0, ctc=0.1, fc=1.0, fcc=0.0, fch=False, lr_scale=0.3,
                            enc=False, c=False, proj=False, dec=True, enc_lr=0.0),
     }
     return table[int(phase)]
@@ -74,7 +82,7 @@ def _loaders(cfg, model, mode):
 
 
 def _optim(model, cfg, ps):
-    lr = float(cfg.train.lr)
+    lr = float(cfg.train.lr) * float(ps.get("lr_scale", 1.0))   # per-phase LR (research recipe)
     enc_params = [p for p in model.encoder.parameters() if p.requires_grad]
     other = [p for n, p in model.named_parameters()
              if p.requires_grad and not n.startswith("encoder.")]

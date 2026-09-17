@@ -12,11 +12,29 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from ..env import log
+
+# ---- live token/cost meter (shared across the concurrent hits) ----
+_TOK = {"in": 0, "out": 0, "calls": 0}
+_TLOCK = threading.Lock()
+
+
+def _price():
+    return (float(os.environ.get("KUPE_LLM_PRICE_IN", 0)),    # $ per 1M input tokens
+            float(os.environ.get("KUPE_LLM_PRICE_OUT", 0)))   # $ per 1M output tokens
+
+
+def token_report() -> str:
+    pi, po = _price()
+    cost = _TOK["in"] / 1e6 * pi + _TOK["out"] / 1e6 * po
+    money = f" ~${cost:,.2f}" if (pi or po) else " (set KUPE_LLM_PRICE_IN/OUT for $)"
+    return (f"tokens so far: in={_TOK['in']:,} out={_TOK['out']:,} "
+            f"total={_TOK['in'] + _TOK['out']:,} over {_TOK['calls']} calls{money}")
 from .scenarios import RULES, sample_scenarios
 from .schema import SchemaError, validate_row
 
@@ -60,14 +78,29 @@ def build_user_prompt(batch: list[dict], n_rows: int, scen_hint: list[str]) -> s
 
 
 def call_llm(messages, cfg, timeout=90) -> str:
-    body = json.dumps({"model": cfg["model"], "messages": messages,
-                       "temperature": 0.8, "max_tokens": 4000}).encode()
-    req = urllib.request.Request(
-        cfg["base_url"].rstrip("/") + "/chat/completions", data=body,
-        headers={"Content-Type": "application/json",
-                 "Authorization": f"Bearer {cfg['api_key']}"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        data = json.load(r)
+    # newer OpenAI models use max_completion_tokens and only accept default temperature.
+    params = {"model": cfg["model"], "messages": messages,
+              "temperature": 0.8, "max_completion_tokens": 4000}
+    url = cfg["base_url"].rstrip("/") + "/chat/completions"
+    hdr = {"Content-Type": "application/json", "Authorization": f"Bearer {cfg['api_key']}"}
+    for _ in range(4):
+        req = urllib.request.Request(url, data=json.dumps(params).encode(), headers=hdr)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                data = json.load(r)
+            break
+        except urllib.error.HTTPError as e:
+            msg = e.read().decode()[:300] if e.code == 400 else ""
+            if e.code == 400 and "temperature" in msg:
+                params.pop("temperature", None); continue          # model wants default temp
+            if e.code == 400 and "max_tokens" in msg and "max_completion_tokens" not in params:
+                params["max_completion_tokens"] = params.pop("max_tokens", 4000); continue
+            raise
+    u = data.get("usage", {}) or {}
+    with _TLOCK:
+        _TOK["in"] += int(u.get("prompt_tokens", 0))
+        _TOK["out"] += int(u.get("completion_tokens", 0))
+        _TOK["calls"] += 1
     return data["choices"][0]["message"]["content"]
 
 
@@ -206,6 +239,10 @@ def generate(clips: list[dict], *, rows_per_hit=22, clips_per_hit=5,
                 seen_ledger.mark(_batch_id(b), "done", rows=len(rows))
             if push_cb:
                 push_cb(rows)
+            if not mock and _TOK["calls"] % 10 == 0:
+                log.info("[cost] %s | rows=%d", token_report(), len(out))
+    if not mock:
+        log.info("[cost] FINAL %s | rows=%d", token_report(), len(out))
     return out
 
 

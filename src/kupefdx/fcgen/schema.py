@@ -39,7 +39,9 @@ def render_target(timeline: list[dict]) -> str:
         elif kind == "pause" and flag in BARE_FLAGS:
             parts.append(flag)
         # pause with no flag (NOP / trap) -> emit nothing
-    return normalize(" ".join(p for p in parts if p))
+    # NOTE: join WITHOUT a final normalize() — that would strip the < > of the flag tokens.
+    # Each text/surface piece is already normalized above; flags are kept verbatim.
+    return " ".join(p for p in parts if p).strip()
 
 
 class SchemaError(ValueError):
