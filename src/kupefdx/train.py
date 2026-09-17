@@ -150,6 +150,12 @@ def train(cfg, phase: int, resume: str | None = None) -> str:
     epochs = int(cfg.train.epochs)
     accum = int(getattr(cfg.train, "grad_accum", 1))
     total_steps = max(1, (len(train_dl) * epochs) // accum)
+    # LLaVA-style projector warmup: train the projector alone for the first N steps, then
+    # unfreeze Nandi. Lets ALIGN be ONE run (merges the old warmup+align phases).
+    warmup_proj = int(getattr(cfg.train, "warmup_proj_steps", 0))
+    if warmup_proj > 0 and ps["dec"]:
+        model._set(model.lm, False)                 # freeze Nandi during the warmup window
+        log.info("projector warmup: Nandi frozen for first %d steps", warmup_proj)
     opt = _optim(model, cfg, ps)
     sched = _sched(opt, cfg, total_steps)
 
@@ -202,6 +208,10 @@ def train(cfg, phase: int, resume: str | None = None) -> str:
                 float(cfg.train.max_grad_norm))
             opt.step(); sched.step(); opt.zero_grad()
             step += 1
+
+            if warmup_proj and step == warmup_proj and ps["dec"]:
+                model._set(model.lm, True)          # end of warmup: unfreeze Nandi
+                log.info("projector warmup done at step %d — Nandi unfrozen", step)
 
             if step % log_steps == 0:
                 parts = " ".join(f"{k}={float(v):.3f}" for k, v in out.items() if k != "loss")

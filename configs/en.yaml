@@ -61,6 +61,7 @@ train:
   save_steps: 1000
   fc_weight: 3.0
   eos_lead_ms: 160
+  warmup_proj_steps: 500   # LLaVA-style: projector-only for first N steps, then unfreeze Nandi
   push_to_hub: true
 
 fc:

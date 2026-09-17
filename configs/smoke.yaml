@@ -61,6 +61,7 @@ train:
   save_steps: 6
   fc_weight: 3.0
   eos_lead_ms: 160        # predictive end-of-turn: label EOS ~160ms early (sub-100ms endpoint)
+  warmup_proj_steps: 2   # LLaVA-style: projector-only for first N steps, then unfreeze Nandi
   push_to_hub: false
 
 fc:
