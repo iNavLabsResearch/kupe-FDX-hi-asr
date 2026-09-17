@@ -277,13 +277,17 @@ def download_worker(a, cfg, src_name, led, dl_q: Queue, dl_bar: tqdm, err_box: l
                     skip = should_skip(si)
                 continue
 
-            aud = ex[acol]
-            if not isinstance(aud, dict) or "array" not in aud:
+            try:                                    # never let one bad clip crash the run
+                aud = ex[acol]
+                if not isinstance(aud, dict) or "array" not in aud:
+                    continue
+                arr = np.asarray(aud["array"], dtype="float32")
+                sr = aud["sampling_rate"]
+                if sr != SAMPLE_RATE:
+                    arr = _resample(arr, sr, SAMPLE_RATE)
+            except Exception as _e:
+                tqdm.write(f"skip bad clip j={j}: {_e}")
                 continue
-            arr = np.asarray(aud["array"], dtype="float32")
-            sr = aud["sampling_rate"]
-            if sr != SAMPLE_RATE:
-                arr = _resample(arr, sr, SAMPLE_RATE)
             dur = len(arr) / SAMPLE_RATE
             if not _keep(text, dur):
                 continue
