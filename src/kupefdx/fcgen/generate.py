@@ -446,9 +446,11 @@ def _dom_hit(batch, mock, on_delta):
     else:
         cards = "\n".join(f"- clip {i} (id={c['id']}, domain={c['domain']}): \"{c['transcript']}\""
                           for i, c in enumerate(batch))
-        user = (f"For each clip, produce a correction record: inject a realistic domain ASR error "
-                f"into omni_raw_transcript and give the corrected_transcript with correction_spans "
-                f"(raw/fixed/reason). Clips:\n{cards}\n"
+        user = (f"For each clip, produce a correction record. You MUST inject 1-3 realistic ASR "
+                f"errors (domain term, homophone, or word-boundary slip) into omni_raw_transcript, "
+                f"then give the fully corrected_transcript. The two MUST differ — never return them "
+                f"identical, and every correction_spans[i].raw MUST actually appear in "
+                f"omni_raw_transcript. Clips:\n{cards}\n"
                 f'Schema: {{"domain","omni_raw_transcript","context":[],"corrected_transcript",'
                 f'"correction_spans":[{{"raw","fixed","reason"}}]}}. Return ONLY the JSON array.')
         try:
@@ -457,18 +459,26 @@ def _dom_hit(batch, mock, on_delta):
         except Exception as e:
             cprint(C.BAD, f"domain hit FAIL in {time.time()-t0:4.1f}s ({e})")
             recs = []
-    out = []
+    out, noop = [], 0
     for i, r in enumerate(recs):
         clip = batch[i % len(batch)]
         try:
-            out.append(_dom_row(r, clip["audio"], f"{clip['id']}_dom{i:02d}"))
+            row = _dom_row(r, clip["audio"], f"{clip['id']}_dom{i:02d}")
         except Exception:
-            pass
+            continue
+        if row["text"].strip() == row["target_sequence"].strip():   # no-op teaches nothing -> drop
+            noop += 1
+            continue
+        out.append(row)
+    if noop:
+        with _DLOCK:
+            _DIAG["dropped"] += noop
     if not mock:
         with _DLOCK:
             _DIAG["hits"] += 1; hd = _DIAG["hits"]
         cprint(C.OK if out else C.WARN,
-               f"domain hit {hd}: kept {len(out)}/{len(recs)} in {time.time()-t0:4.1f}s · {token_report()}")
+               f"domain hit {hd}: kept {len(out)}/{len(recs)} ({noop} no-op dropped) "
+               f"in {time.time()-t0:4.1f}s · {token_report()}")
     return out
 
 
