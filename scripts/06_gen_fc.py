@@ -31,11 +31,18 @@ from kupefdx.fcgen.scenarios import distribution_table, rebalance, set_weights
 from kupefdx.ledger import ShardLedger
 
 
-def build_clips(src_rows, limit):
+def build_clips(src_rows, limit, cache_path=None):
     from concurrent.futures import ThreadPoolExecutor
+    from kupefdx.jsonl import read_manifest as _rm, write_manifest as _wm
     rows = [r for r in src_rows[: limit or None] if os.path.isfile(r["audio"])]
     missing = len(src_rows[: limit or None]) - len(rows)
     n = len(rows)
+    # reuse a previous probe so repeated restarts don't re-probe every wav
+    if cache_path and os.path.isfile(cache_path):
+        cached = {c["id"]: c for c in _rm(cache_path)}
+        if all(r["id"] in cached for r in rows):
+            log.info("loaded %d probed clips from cache %s (skip re-probe)", len(rows), cache_path)
+            return [cached[r["id"]] for r in rows]
     workers = min(48, max(4, (os.cpu_count() or 8)))
     log.info("probing %d clips for pause/timing (%d workers)%s ...", n, workers,
              f"  [{missing} skipped: no local wav]" if missing else "")
@@ -53,6 +60,12 @@ def build_clips(src_rows, limit):
             if i % 500 == 0 or i == n:
                 rate = i / max(1e-6, time.time() - t0)
                 log.info("  probed %d/%d clips (%.0f/s)", i, n, rate)
+    if cache_path:
+        try:
+            _wm(cache_path, clips)
+            log.info("cached probed clips -> %s (reused on restart)", cache_path)
+        except Exception as e:
+            log.warning("probe-cache write failed: %s", e)
     return clips
 
 
@@ -103,7 +116,7 @@ def main():
              n0, len(src_rows), inc or "-", exc or "-")
     if not src_rows:
         raise SystemExit("no conversational clips left after domain filter — check --include/--exclude-domains")
-    clips = build_clips(src_rows, a.limit)
+    clips = build_clips(src_rows, a.limit, cache_path=a.src + ".cards.jsonl")
     log.info("probed %d clips from %s", len(clips), a.src)
 
     led = ShardLedger(os.path.join(cfg.paths.ledger_dir, "fcgen.json"), "fcgen")
