@@ -37,7 +37,7 @@ for entry in "${DATASETS[@]}"; do
   CFGFLAG=(--hf-config "$CFGNAME"); [ "$CFGNAME" = "-" ] && CFGFLAG=()
   python scripts/11_shard_pipeline.py --config "$CFG" \
       --hf-id "$ID" "${CFGFLAG[@]}" --split "$SPLIT" \
-      --domain "$DOMAIN" --shard-size "$SHARD" --max-hours "$MAXH" $EXTRA \
+      --domain "$DOMAIN" --shard-size "$SHARD" --upload-every "${UPLOAD_EVERY:-16}" --max-hours "$MAXH" $EXTRA \
     || echo "!! $ID failed (gated/license/column) — continuing to next source"
 done
 

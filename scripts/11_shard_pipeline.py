@@ -407,7 +407,7 @@ def main():
     ap.add_argument("--encode-batch", type=int, default=16)
     ap.add_argument("--max-batch-sec", type=float, default=48.0)
     ap.add_argument("--prefetch", type=int, default=6)
-    ap.add_argument("--upload-every", type=int, default=8,
+    ap.add_argument("--upload-every", type=int, default=16,
                     help="shards per Hub commit (HF limit ≈128 commits/hour)")
     ap.add_argument("--shard-start", type=int, default=0)
     ap.add_argument("--stride", type=int, default=1)
