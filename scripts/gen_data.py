@@ -34,23 +34,36 @@ from kupefdx.fcgen.scenarios import (distribution_table, rebalance, set_weights)
 from kupefdx.ledger import ShardLedger
 
 
+def _synth_features(dur: float) -> dict:
+    """Duration-only feature card when the raw wav is not on this box (feats-only pull).
+    No real pause grounding — the LLM places flags from transcript + duration."""
+    return {"duration_s": round(float(dur), 2), "sample_rate": 16000, "n_pauses": 0,
+            "pauses": [], "leading_silence_s": 0.0, "trailing_silence_s": 0.0,
+            "speech_fraction": 1.0, "mean_energy_db": -20.0}
+
+
 def probe_clips(rows, limit, cache_path):
-    """Probe pause/timing for each clip once (reused by FC and domain). Cached to disk so
-    restarts skip re-probing. Fast: native-rate read + vectorized VAD (~1 ms/clip compute)."""
+    """Build one clip card per row (reused by FC and domain). If the raw wav is local we
+    probe it (native-rate read + vectorized VAD, ~1 ms/clip); if not, we fall back to a
+    duration-only card so generation still runs on a feats-only box. Cached to disk."""
     from concurrent.futures import ThreadPoolExecutor
     from kupefdx.jsonl import read_manifest as _rm, write_manifest as _wm
-    rows = [r for r in rows[: limit or None] if os.path.isfile(r["audio"])]
+    rows = rows[: limit or None]
     n = len(rows)
+    have = sum(1 for r in rows if os.path.isfile(r["audio"]))
+    if have < n:
+        cprint(C.WARN, f"{n - have}/{n} clips have no local wav -> duration-only cards "
+               "(no real pause grounding; pull raw audio for full grounding)")
     if cache_path and os.path.isfile(cache_path):
         cached = {c["id"]: c for c in _rm(cache_path)}
         if all(r["id"] in cached for r in rows):
             cprint(C.INFO, f"loaded {n} probed clips from cache (skip re-probe)")
             return [cached[r["id"]] for r in rows]
     workers = min(64, max(4, (os.cpu_count() or 8) * 2))
-    cprint(C.INFO, f"probing {n} clips for pause/timing ({workers} workers) ...")
+    cprint(C.INFO, f"building {n} clip cards ({have} probed, {n - have} duration-only) ...")
 
     def one(r):
-        f = probe(r["audio"])
+        f = probe(r["audio"]) if os.path.isfile(r["audio"]) else _synth_features(r.get("dur", 0))
         return {"id": r["id"], "audio": r["audio"], "transcript": r["text"],
                 "domain": r.get("domain", "general"), "features": f,
                 "card": audio_card(f, r["text"])}
@@ -168,10 +181,11 @@ def main():
         clips = probe_clips(fc_src, a.limit, a.src + ".cards.jsonl")
         run_fc(cfg, clips, a)
     if a.only in ("both", "domain"):
-        # domain correction works on any clip (no probe needed) — reuse whole corpus
+        # domain correction only needs the transcript (audio path is kept as a reference),
+        # so it runs on the whole corpus even on a feats-only box.
         dclips = [{"id": r["id"], "audio": r["audio"], "transcript": r["text"],
                    "domain": r.get("domain", "general")}
-                  for r in src[: a.limit or None] if os.path.isfile(r["audio"])]
+                  for r in src[: a.limit or None]]
         run_domain(cfg, dclips, a)
 
 
