@@ -77,10 +77,44 @@ def build_user_prompt(batch: list[dict], n_rows: int, scen_hint: list[str]) -> s
         f"it); only decide flag placement, surfaces and context. Return ONLY the JSON array.")
 
 
-def call_llm(messages, cfg, timeout=90) -> str:
+MAX_OUT_TOKENS = int(os.environ.get("KUPE_LLM_MAX_OUT", 8000))
+STREAM = os.environ.get("KUPE_LLM_STREAM", "1") != "0"
+
+
+def _read_sse(resp, on_delta=None):
+    """Consume an OpenAI-compatible SSE stream, returning (content, usage_dict)."""
+    content_parts = []
+    usage = {}
+    for raw_line in resp:
+        line = raw_line.decode("utf-8", "ignore").strip()
+        if not line or not line.startswith("data:"):
+            continue
+        payload = line[len("data:"):].strip()
+        if payload == "[DONE]":
+            break
+        try:
+            chunk = json.loads(payload)
+        except Exception:
+            continue
+        if chunk.get("usage"):
+            usage = chunk["usage"]
+        for ch in chunk.get("choices", []):
+            delta = (ch.get("delta") or {}).get("content") or ""
+            if delta:
+                content_parts.append(delta)
+                if on_delta:
+                    on_delta(delta)
+    return "".join(content_parts), usage
+
+
+def call_llm(messages, cfg, timeout=90, stream=None, on_delta=None) -> str:
     # newer OpenAI models use max_completion_tokens and only accept default temperature.
+    stream = STREAM if stream is None else stream
     params = {"model": cfg["model"], "messages": messages,
-              "temperature": 0.8, "max_completion_tokens": 4000}
+              "temperature": 0.8, "max_completion_tokens": MAX_OUT_TOKENS}
+    if stream:
+        params["stream"] = True
+        params["stream_options"] = {"include_usage": True}
     url = cfg["base_url"].rstrip("/") + "/chat/completions"
     hdr = {"Content-Type": "application/json", "Authorization": f"Bearer {cfg['api_key']}"}
     backoff = 5
@@ -88,7 +122,12 @@ def call_llm(messages, cfg, timeout=90) -> str:
         req = urllib.request.Request(url, data=json.dumps(params).encode(), headers=hdr)
         try:
             with urllib.request.urlopen(req, timeout=timeout) as r:
-                data = json.load(r)
+                if params.get("stream"):
+                    content, u = _read_sse(r, on_delta)
+                else:
+                    data = json.load(r)
+                    u = data.get("usage", {}) or {}
+                    content = data["choices"][0]["message"]["content"]
             break
         except urllib.error.HTTPError as e:
             if e.code == 429:                                       # rate limited -> wait, retry
@@ -99,16 +138,43 @@ def call_llm(messages, cfg, timeout=90) -> str:
             if e.code == 400 and "temperature" in msg:
                 params.pop("temperature", None); continue          # model wants default temp
             if e.code == 400 and "max_tokens" in msg and "max_completion_tokens" not in params:
-                params["max_completion_tokens"] = params.pop("max_tokens", 4000); continue
+                params["max_completion_tokens"] = params.pop("max_tokens", MAX_OUT_TOKENS); continue
+            if e.code == 400 and params.get("stream"):
+                params.pop("stream", None); params.pop("stream_options", None); continue  # provider can't stream
             raise
     else:
         raise RuntimeError("LLM call failed after retries (429/backoff exhausted)")
-    u = data.get("usage", {}) or {}
     with _TLOCK:
         _TOK["in"] += int(u.get("prompt_tokens", 0))
         _TOK["out"] += int(u.get("completion_tokens", 0))
         _TOK["calls"] += 1
-    return data["choices"][0]["message"]["content"]
+    return content
+
+
+def _salvage_array(t: str) -> list[dict]:
+    """Recover complete row objects from a JSON array truncated mid-stream (hit the
+    output-token cap). A truncated tail is a partial-loss bug otherwise: a whole hit's
+    tokens spent for 0 rows."""
+    start = t.find("[")
+    if start < 0:
+        return []
+    dec = json.JSONDecoder()
+    i = start + 1
+    out = []
+    n = len(t)
+    while i < n:
+        while i < n and t[i] in " \t\r\n,":
+            i += 1
+        if i >= n or t[i] in "]":
+            break
+        try:
+            obj, end = dec.raw_decode(t, i)
+        except Exception:
+            break                                  # first broken/incomplete object -> stop
+        if isinstance(obj, dict):
+            out.append(obj)
+        i = end
+    return out
 
 
 def parse_rows(text: str) -> list[dict]:
@@ -135,6 +201,9 @@ def parse_rows(text: str) -> list[dict]:
                 if isinstance(obj.get(key), list):
                     return [r for r in obj[key] if isinstance(r, dict)]
             return [obj]                          # a single row object
+    salvaged = _salvage_array(t)                   # response got cut off mid-array
+    if salvaged:
+        return salvaged
     return []
 
 
@@ -221,7 +290,7 @@ def _diag_drop(reason):
         _DIAG["reasons"][key] = _DIAG["reasons"].get(key, 0) + 1
 
 
-def _one_hit(batch, n_rows, cfg, mock) -> list[dict]:
+def _one_hit(batch, n_rows, cfg, mock, on_delta=None) -> list[dict]:
     t0 = time.time()
     if mock:
         rows = _mock_rows(batch, n_rows)
@@ -235,10 +304,12 @@ def _one_hit(batch, n_rows, cfg, mock) -> list[dict]:
         err = None
         for attempt in range(3):
             try:
-                raw = call_llm(msgs, cfg)
+                raw = call_llm(msgs, cfg, on_delta=on_delta)
                 rows = parse_rows(raw)
                 if rows:
                     break
+                log.warning("hit produced 0 rows on attempt %d (%d chars raw, ends: ...%s)",
+                            attempt + 1, len(raw), raw[-120:].replace("\n", " "))
             except Exception as e:
                 err = e
                 log.warning("LLM hit failed (attempt %d): %s", attempt + 1, e)
@@ -285,7 +356,8 @@ def _one_hit(batch, n_rows, cfg, mock) -> list[dict]:
 
 
 def generate(clips: list[dict], *, rows_per_hit=22, clips_per_hit=5,
-             concurrency=10, mock=False, seen_ledger=None, push_cb=None) -> list[dict]:
+             concurrency=10, mock=False, seen_ledger=None, push_cb=None,
+             show_stream=False) -> list[dict]:
     """clips: [{id, audio, transcript, domain, features, card}]. Returns validated rows."""
     cfg = _llm_cfg()
     if not mock and not cfg["api_key"]:
@@ -293,11 +365,15 @@ def generate(clips: list[dict], *, rows_per_hit=22, clips_per_hit=5,
     batches = [clips[i:i + clips_per_hit] for i in range(0, len(clips), clips_per_hit)]
     if seen_ledger is not None:
         batches = [b for b in batches if not seen_ledger.is_done(_batch_id(b))]
-    log.info("FC gen: %d clips -> %d hits x ~%d rows (mock=%s, conc=%d)",
-             len(clips), len(batches), rows_per_hit, mock, concurrency)
+    log.info("FC gen: %d clips -> %d hits x ~%d rows (mock=%s, conc=%d, max_out=%d, stream=%s)",
+             len(clips), len(batches), rows_per_hit, mock, concurrency, MAX_OUT_TOKENS, STREAM)
+    on_delta = (lambda s: print(s, end="", flush=True)) if (show_stream and not mock) else None
+    if on_delta and concurrency > 1:
+        log.warning("--show-stream with concurrency=%d: chunks from parallel hits will interleave; "
+                    "pass --concurrency 1 to watch one call cleanly", concurrency)
     out = []
     with ThreadPoolExecutor(max_workers=concurrency) as ex:
-        futs = {ex.submit(_one_hit, b, rows_per_hit, cfg, mock): b for b in batches}
+        futs = {ex.submit(_one_hit, b, rows_per_hit, cfg, mock, on_delta): b for b in batches}
         for fut in tqdm(as_completed(futs), total=len(futs), desc="fc-gen"):
             b = futs[fut]
             try:

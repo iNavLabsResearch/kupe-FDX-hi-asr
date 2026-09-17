@@ -85,6 +85,9 @@ def main():
     ap.add_argument("--rows-per-hit", type=int, default=22)
     ap.add_argument("--clips-per-hit", type=int, default=5)
     ap.add_argument("--concurrency", type=int, default=10)
+    ap.add_argument("--show-stream", action="store_true",
+                    help="print the model's SSE token stream live to stdout as it generates "
+                         "(use with --concurrency 1 to watch one call cleanly)")
     ap.add_argument("--no-push", action="store_true", help="do NOT auto-sync the result to the Hub")
     # floor-control needs CONVERSATIONAL clips; lecture monologues (NPTEL) teach bad turn-taking.
     ap.add_argument("--exclude-domains", default="indian_english,read_us",
@@ -128,7 +131,8 @@ def main():
         write_manifest(a.out, existing)
 
     rows = generate(clips, rows_per_hit=a.rows_per_hit, clips_per_hit=a.clips_per_hit,
-                    concurrency=a.concurrency, mock=a.mock, seen_ledger=led, push_cb=_push)
+                    concurrency=a.concurrency, mock=a.mock, seen_ledger=led, push_cb=_push,
+                    show_stream=a.show_stream)
     all_rows = existing
     all_rows = rebalance(all_rows)
     for i, r in enumerate(all_rows):
