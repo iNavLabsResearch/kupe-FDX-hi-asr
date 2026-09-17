@@ -50,7 +50,9 @@ for entry in "${DATASETS[@]}"; do
   python scripts/11_shard_pipeline.py --config "$CFG" \
       --hf-id "$ID" "${CFGFLAG[@]}" --split "$SPLIT" \
       --domain "$DOMAIN" --shard-size "$SHARD" --upload-every "${UPLOAD_EVERY:-16}" \
-      --dl-workers "${DL_WORKERS:-4}" --max-hours "$MAXH" $EXTRA \
+      --dl-workers "${DL_WORKERS:-4}" \
+      --encode-batch "${ENCODE_BATCH:-64}" --max-batch-sec "${MAX_BATCH_SEC:-300}" \
+      --prefetch "${PREFETCH:-12}" --max-hours "$MAXH" $EXTRA \
     || echo "!! $ID failed (gated/license/column) — continuing to next source"
 done
 
