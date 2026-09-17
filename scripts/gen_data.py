@@ -42,27 +42,71 @@ def _synth_features(dur: float) -> dict:
             "speech_fraction": 1.0, "mean_energy_db": -20.0}
 
 
-def probe_clips(rows, limit, cache_path):
+def _hub_raw_index(cfg):
+    """Set of raw/* wav paths that exist on the data repo (empty if raw was never pushed)."""
+    try:
+        from huggingface_hub import HfApi
+        from kupefdx.env import require_token
+        api = HfApi()
+        return {f for f in api.list_repo_files(cfg.repos.data, repo_type="dataset",
+                                               token=require_token()) if f.startswith("raw/")}
+    except Exception as e:
+        cprint(C.WARN, f"could not check Hub for raw audio: {e}")
+        return set()
+
+
+def _hub_path(audio: str) -> str:
+    """Local `data/raw/wavs/...wav` -> Hub `raw/wavs/...wav`."""
+    return audio.split("data/", 1)[-1] if audio.startswith("data/") else audio
+
+
+def _fetch_wav(cfg, audio: str, raw_set: set) -> bool:
+    """Download one raw wav from the Hub into its manifest path if available. True on success."""
+    hp = _hub_path(audio)
+    if hp not in raw_set:
+        return False
+    try:
+        from huggingface_hub import hf_hub_download
+        from kupefdx.env import require_token
+        hf_hub_download(cfg.repos.data, hp, repo_type="dataset",
+                        local_dir=cfg.paths.data_dir, token=require_token())
+        return os.path.isfile(audio)
+    except Exception:
+        return False
+
+
+def probe_clips(rows, limit, cache_path, cfg=None, fetch=True):
     """Build one clip card per row (reused by FC and domain). If the raw wav is local we
-    probe it (native-rate read + vectorized VAD, ~1 ms/clip); if not, we fall back to a
-    duration-only card so generation still runs on a feats-only box. Cached to disk."""
+    probe it (native-rate read + vectorized VAD, ~1 ms/clip). If not, we auto-fetch it from
+    the Hub when raw audio is available there; otherwise we fall back to a duration-only card
+    so generation still runs on a feats-only box. Cached to disk."""
     from concurrent.futures import ThreadPoolExecutor
     from kupefdx.jsonl import read_manifest as _rm, write_manifest as _wm
     rows = rows[: limit or None]
     n = len(rows)
-    have = sum(1 for r in rows if os.path.isfile(r["audio"]))
-    if have < n:
-        cprint(C.WARN, f"{n - have}/{n} clips have no local wav -> duration-only cards "
-               "(no real pause grounding; pull raw audio for full grounding)")
     if cache_path and os.path.isfile(cache_path):
         cached = {c["id"]: c for c in _rm(cache_path)}
         if all(r["id"] in cached for r in rows):
             cprint(C.INFO, f"loaded {n} probed clips from cache (skip re-probe)")
             return [cached[r["id"]] for r in rows]
+
+    # auto-fetch: only attempt if raw audio actually exists on the Hub (one list call, not N 404s)
+    raw_set = set()
+    have = sum(1 for r in rows if os.path.isfile(r["audio"]))
+    if fetch and have < n and cfg is not None:
+        raw_set = _hub_raw_index(cfg)
+        if raw_set:
+            cprint(C.INFO, f"auto-fetching missing wavs from {cfg.repos.data} (raw available) ...")
+        else:
+            cprint(C.WARN, f"{n - have}/{n} clips have no local wav and the Hub has NO raw audio "
+                   "-> duration-only cards. For real pause grounding, generate on the box with "
+                   "data/raw/, or push raw (PUSH_RAW=1 gather).")
     workers = min(64, max(4, (os.cpu_count() or 8) * 2))
-    cprint(C.INFO, f"building {n} clip cards ({have} probed, {n - have} duration-only) ...")
+    cprint(C.INFO, f"building {n} clip cards ({workers} workers) ...")
 
     def one(r):
+        if not os.path.isfile(r["audio"]) and raw_set:
+            _fetch_wav(cfg, r["audio"], raw_set)
         f = probe(r["audio"]) if os.path.isfile(r["audio"]) else _synth_features(r.get("dur", 0))
         return {"id": r["id"], "audio": r["audio"], "transcript": r["text"],
                 "domain": r.get("domain", "general"), "features": f,
@@ -161,6 +205,8 @@ def main():
     ap.add_argument("--show-stream", action="store_true",
                     help="print the live SSE token stream (runs one call at a time)")
     ap.add_argument("--no-push", action="store_true", help="never sync to the Hub")
+    ap.add_argument("--no-fetch-audio", dest="fetch_audio", action="store_false",
+                    help="do NOT auto-download missing raw wavs from the Hub (use duration-only)")
     # FC needs CONVERSATIONAL clips; lecture monologues teach bad turn-taking.
     ap.add_argument("--exclude-domains", default="indian_english,read_us")
     ap.add_argument("--include-domains", default="")
@@ -178,7 +224,7 @@ def main():
     if a.only in ("both", "fc"):
         if not fc_src:
             raise SystemExit("no conversational clips for FC — check --include/--exclude-domains")
-        clips = probe_clips(fc_src, a.limit, a.src + ".cards.jsonl")
+        clips = probe_clips(fc_src, a.limit, a.src + ".cards.jsonl", cfg=cfg, fetch=a.fetch_audio)
         run_fc(cfg, clips, a)
     if a.only in ("both", "domain"):
         # domain correction only needs the transcript (audio path is kept as a reference),
