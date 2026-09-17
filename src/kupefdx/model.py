@@ -215,16 +215,26 @@ class KupeFDXModel(nn.Module):
         results = []
         for b in range(feats.shape[0]):
             H = pre[b][None].to(self._dtype)            # [1, L, hidden]
-            out_ids = []
+            out_ids, past, step_emb = [], None, H
             for _ in range(int(max_new_tokens)):
-                attn = torch.ones(1, H.shape[1], dtype=torch.long, device=self.device)
-                logits = self.lm(inputs_embeds=H, attention_mask=attn).logits[:, -1]
+                try:                                    # KV-cache path (real Nandi): O(n)
+                    res = self.lm(inputs_embeds=step_emb, past_key_values=past, use_cache=True)
+                    past = getattr(res, "past_key_values", None)
+                    logits = res.logits[:, -1]
+                    if past is None:                    # decoder has no cache -> fall back
+                        raise RuntimeError("no cache")
+                    kv = True
+                except Exception:                       # recompute path (TinyNandi): O(n^2)
+                    attn = torch.ones(1, H.shape[1], dtype=torch.long, device=self.device)
+                    logits = self.lm(inputs_embeds=H, attention_mask=attn).logits[:, -1]
+                    kv = False
                 nxt = int(logits.argmax(-1).item())
                 if nxt == self.eos_id:
                     break
                 out_ids.append(nxt)
                 nemb = self._embed_ids(torch.tensor([[nxt]], device=self.device)).to(self._dtype)
                 H = torch.cat([H, nemb], dim=1)
+                step_emb = nemb if kv else H            # KV: feed only the new token
             results.append(out_ids)
         return results
 
