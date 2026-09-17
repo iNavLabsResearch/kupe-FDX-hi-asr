@@ -8,20 +8,33 @@ durations, not the waveform.
 from __future__ import annotations
 
 import numpy as np
+from numpy.lib.stride_tricks import sliding_window_view
 
-from ..audio import load_wav
 from ..constants import SAMPLE_RATE
+
+
+def _read_native(path: str) -> tuple[np.ndarray, int]:
+    """Decode a wav to mono float32 at its NATIVE sample rate (no resample).
+    The VAD works in ms, so the sample rate is irrelevant to pause/timing — skipping
+    the 16 kHz resample removes the biggest per-clip cost."""
+    import soundfile as sf
+    wav, sr = sf.read(path, dtype="float32", always_2d=False)
+    if wav.ndim == 2:
+        wav = wav.mean(axis=1)
+    return wav.astype(np.float32, copy=False), int(sr)
 
 
 def _energy_vad(wav: np.ndarray, sr: int, frame_ms=25, hop_ms=10,
                 thresh_db=-35.0, min_pause_ms=200):
-    hop = int(sr * hop_ms / 1000)
-    win = int(sr * frame_ms / 1000)
-    n = 1 + max(0, (len(wav) - win) // hop)
-    energies = np.empty(n, dtype=np.float32)
-    for i in range(n):
-        seg = wav[i * hop: i * hop + win]
-        energies[i] = 10 * np.log10(np.mean(seg ** 2) + 1e-9)
+    hop = max(1, int(sr * hop_ms / 1000))
+    win = max(1, int(sr * frame_ms / 1000))
+    if len(wav) < win:
+        return np.zeros(0, np.float32), np.zeros(0, bool), []
+    # vectorized framing: strided windows [n, win], energy in one numpy pass
+    frames = sliding_window_view(wav, win)[::hop]
+    energies = (10 * np.log10(np.mean(frames.astype(np.float32) ** 2, axis=1) + 1e-9)
+                ).astype(np.float32)
+    n = len(energies)
     speech = energies > thresh_db
     # collapse to pause intervals (runs of non-speech), keep those >= min_pause
     pauses, i = [], 0
@@ -40,7 +53,7 @@ def _energy_vad(wav: np.ndarray, sr: int, frame_ms=25, hop_ms=10,
 
 
 def probe(path: str, sr: int = SAMPLE_RATE) -> dict:
-    wav = load_wav(path, sr)
+    wav, sr = _read_native(path)            # native sr; VAD is sr-agnostic (works in ms)
     dur = len(wav) / sr
     energies, speech, pauses = _energy_vad(wav, sr)
     speech_frac = float(speech.mean()) if len(speech) else 0.0

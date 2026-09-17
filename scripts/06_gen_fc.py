@@ -84,10 +84,11 @@ def main():
     ap.add_argument("--limit", type=int, default=0, help="cap source clips (0 = all)")
     ap.add_argument("--rows-per-hit", type=int, default=22)
     ap.add_argument("--clips-per-hit", type=int, default=5)
-    ap.add_argument("--concurrency", type=int, default=10)
+    ap.add_argument("--concurrency", type=int, default=0,
+                    help="in-flight LLM calls (default 10; forced to 1 under --show-stream)")
     ap.add_argument("--show-stream", action="store_true",
-                    help="print the model's SSE token stream live to stdout as it generates "
-                         "(use with --concurrency 1 to watch one call cleanly)")
+                    help="print the model's live SSE token stream to stdout; runs one call at a "
+                         "time so the output is readable (override with an explicit --concurrency)")
     ap.add_argument("--no-push", action="store_true", help="do NOT auto-sync the result to the Hub")
     # floor-control needs CONVERSATIONAL clips; lecture monologues (NPTEL) teach bad turn-taking.
     ap.add_argument("--exclude-domains", default="indian_english,read_us",
@@ -95,6 +96,9 @@ def main():
     ap.add_argument("--include-domains", default="",
                     help="comma domains to KEEP (overrides exclude); e.g. spontaneous,accented")
     a = ap.parse_args()
+    # --show-stream is a "watch one call live" mode -> default to sequential so SSE tokens
+    # from different hits don't interleave; an explicit --concurrency still wins.
+    a.concurrency = a.concurrency or (1 if a.show_stream else 10)
     cfg = load_config(a.config)
 
     fc_cfg = getattr(cfg, "fc", None)
