@@ -25,16 +25,23 @@ def main():
     cfg = load_config(a.config)
     enc_dir = os.path.join(cfg.paths.data_dir, "encoded")
 
-    shard_manifests = sorted(glob.glob(os.path.join(enc_dir, "shards", "*", "manifest.jsonl")))
+    # feats.npz + manifest.jsonl are written side-by-side (in shards/<sid>/_hub/ locally,
+    # or encoded/<sid>/ when pulled from the Hub) — search recursively and resolve feats
+    # relative to each manifest's OWN directory, so both layouts work.
+    shard_manifests = sorted(
+        glob.glob(os.path.join(enc_dir, "shards", "**", "manifest.jsonl"), recursive=True)
+        + glob.glob(os.path.join(enc_dir, "**", "manifest.jsonl"), recursive=True))
+    shard_manifests = sorted(set(shard_manifests))
     if not shard_manifests:
-        raise SystemExit(f"no shard manifests under {enc_dir}/shards/*/manifest.jsonl "
-                         "(run 11_shard_pipeline.py with --no-flush first)")
+        raise SystemExit(f"no manifest.jsonl found under {enc_dir}/ — pull feats from the Hub "
+                         "(commands.md §7) or gather with --no-flush first")
     rows, n_feats, seen, dups = [], 0, set(), 0
     for mp in shard_manifests:
+        base = os.path.dirname(mp)
         for r in read_manifest(mp):
-            for key in ("feats", "codes"):            # relative -> absolute local paths
-                if r.get(key) and not os.path.isabs(r[key]):
-                    r[key] = os.path.join(enc_dir, r[key])
+            for key in ("feats", "codes"):            # resolve beside the manifest
+                if r.get(key):
+                    r[key] = os.path.join(base, os.path.basename(r[key]))
             # dedup by content (transcript + rounded duration) so old-namespace shards that
             # overlap the re-encoded ones don't get trained on twice.
             key = (r.get("text", "").strip().lower(), round(float(r.get("dur", 0)), 1))
