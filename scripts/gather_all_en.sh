@@ -20,9 +20,9 @@ EXTRA=""
 # Diversify accents/styles: US read, spontaneous, podcasts/audiobooks, crowd accents,
 # and INDIAN-English lectures. Total pretraining ~4,000+ h.
 DATASETS=(
-  "openslr/librispeech_asr|clean|train.clean.100|read_us|0"          # ~100 h
-  "openslr/librispeech_asr|clean|train.clean.360|read_us|0"          # ~360 h
-  "openslr/librispeech_asr|other|train.other.500|read_us|0"          # ~500 h
+  "openslr/librispeech_asr|clean|train.100|read_us|0"          # ~100 h
+  "openslr/librispeech_asr|clean|train.360|read_us|0"          # ~360 h
+  "openslr/librispeech_asr|other|train.500|read_us|0"          # ~500 h
   "ai4bharat/NPTEL|-|train|indian_english|1000"                      # ~1000 h INDIAN English
   "MLCommons/peoples_speech|clean|train|spontaneous|1000"           # ~1000 h spontaneous
   "speechcolab/gigaspeech|l|train|podcasts_audiobooks|1000"          # ~1000 h (gated: accept)
