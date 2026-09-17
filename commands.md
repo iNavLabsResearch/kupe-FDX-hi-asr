@@ -1,237 +1,176 @@
-# KupeFDX-hi-asr — Complete Commands (clone → data → train → eval → infer)
+# KupeFDX — full command reference (English ASR + floor control)
 
-Everything, in order. Every stage is resumable and Hub-synced. Configs: `configs/smoke.yaml`
-(tiny, CPU/MPS, for verification) and `configs/gpu.yaml` (H100, real models).
+Repo: `iNavLabsResearch/kupe-FDX-hi-asr` · HF data: `anuj-inavlabs/kupe-en-asr-data` (public)
+Config: `configs/en.yaml` (FastConformer encoder + Nandi-Mini-150M).
+
+> **Two data tracks — read this first**
+> - **`feats.npz`** (encoder features) → all you need for **frozen-encoder** training
+>   (phases 1,2,4,5). This is standard for speech-LLMs and reaches ~3% WER because
+>   FastConformer is already a strong pretrained ASR encoder. **Already on the Hub.**
+> - **raw audio** → only needed if you **unfreeze the encoder** (phase 3 JOINT full-FT).
+>   Raw is *not* on the Hub yet (we gathered feats-only). See §7.
 
 ---
 
-## 0. Get the code
+## 0. Clone + environment (any box)
 
 ```bash
 git clone https://github.com/iNavLabsResearch/kupe-FDX-hi-asr.git
 cd kupe-FDX-hi-asr
-```
-HF repos live under **`anuj-inavlabs/`** (set in `configs/*.yaml` → `owner`):
-`anuj-inavlabs/kupe-hi-asr-data` (data), `anuj-inavlabs/KupeFDX-hi-asr-runs` (runs),
-`anuj-inavlabs/KupeFDX-hi-asr` (model).
-
-## 1. Environment setup
-
-```bash
-# --- option A: conda (recommended on the H100 box) ---
-conda create -n kupefdx python=3.11 -y
-conda activate kupefdx
-
-# --- option B: venv ---
 python3 -m venv .venv && source .venv/bin/activate
-
-# core deps
 pip install -r requirements.txt
-
-# GPU box only — real encoder + Nandi + NeMo (FastConformer fallback) + audio:
-pip install "transformers>=4.45" accelerate safetensors datasets soundfile librosa wandb python-dotenv
-pip install "nemo_toolkit[asr]"          # only if using the FastConformer fallback encoder
-# omniASR SSL encoder: install Meta's package on the box, then set encoder_id in configs/gpu.yaml
-# pip install omnilingual-asr            # (confirm exact package/id — PLAN §9.1)
+cp .env.example .env      # then fill HF_TOKEN, KUPE_LLM_API_KEY, (WANDB optional)
+set -a && . ./.env && set +a
 ```
 
-## 2. Secrets
+## 1. Smoke test (proves the whole pipeline wires up, no GPU/net)
 
 ```bash
-cp .env.example .env
-#   edit .env and fill:
-#   HF_TOKEN=hf_...            HF_OWNER=FrontiersMind
-#   WANDB_API_KEY=...          WANDB_PROJECT=kupe-fdx-hi-asr
-#   KUPE_LLM_BASE_URL=https://api.openai.com/v1
-#   KUPE_LLM_API_KEY=sk-...    KUPE_LLM_MODEL=gpt-5.6-luna
+python scripts/00_smoke.py --config configs/smoke.yaml
 ```
 
-## 3. Verify everything on this machine FIRST (no GPU, no keys, seconds)
+## 2. Gather data (fast: parallel download → GPU encode → batched Hub push)
+
+Always run detached so a dropped SSH can't kill it; only ONE job at a time.
 
 ```bash
-bash run_smoke.sh
-# runs: unit tests + full pipeline (prep→encode→quantize→train P1+P3→resume→eval→FC-gen→P4→infer→stream)
-# must print "✅ SMOKE PASS" before you spend GPU money.
+pkill -9 -f 11_shard_pipeline.py; sleep 2
+ps aux | grep -c "[1]1_shard_pipeline.py"   # must print 0
+
+ENCODE_BATCH=96 MAX_BATCH_SEC=400 MAXH_SPONT=2500 \
+  ONLY="peoples_speech voxpopuli" DL_WORKERS=6 \
+  NO_FLUSH=1 RAW_ONLY=0 CFG=configs/en.yaml \
+  nohup bash scripts/gather_all_en.sh > gather.log 2>&1 &
+tail -f gather.log
 ```
 
-## 4. Create the Hub repos (one-time)
+Knobs: `DL_WORKERS` parallel download threads · `ENCODE_BATCH`/`MAX_BATCH_SEC` GPU batch
+· `MAXH_SPONT`/`MAXH_ACCENT`/`MAXH_YODAS` per-source hour caps · `ONLY="id1 id2"` pick
+sources · `NO_FLUSH=1` keep shards on local disk (needed for §4 local build).
+
+Sources (all REAL human speech): LibriSpeech (done) · People's Speech (bulk, varied) ·
+VoxPopuli (accented) · YODAS2 (opt-in, gated, YouTube conversational).
+`MAXH_SPONT=2500` → ~960+2500+500 ≈ **3,960 h**.
+
+## 3. Check what's on the Hub (how much / how many, per source)
 
 ```bash
-python scripts/hf_sync.py push --config configs/gpu.yaml --what manifests   # creates data repo on first push
-# (runs/model repos are auto-created by training when push_to_hub: true)
+python - <<'PY'
+from huggingface_hub import HfApi, hf_hub_download; import os,re,collections,json
+api=HfApi(); rid="anuj-inavlabs/kupe-en-asr-data"; tok=os.environ["HF_TOKEN"]
+c=collections.Counter()
+for f in api.list_repo_files(rid,repo_type="dataset",token=tok):
+    if f.startswith("encoded/") and f.endswith("/feats.npz"):
+        s=re.sub(r'(__w\d+x\d+)?_n\d+_shard_\d+$','',f.split('/')[1]); c[s]+=1
+for s,n in sorted(c.items(),key=lambda x:-x[1]): print(f"{n:5d} shards  {s}")
+p=hf_hub_download(rid,"ledger/shardpipe.json",repo_type="dataset",token=tok)
+m=json.load(open(p)).get("meta",{}); print("LEDGER:",round(sum(v.get('hours',0) for v in m.values()),1),"h")
+PY
 ```
 
----
-
-## 5. Data: SHARDED pipeline (download → encode → push raw+encoded → flush → next shard)
-
-This is the correct disk-light flow: raw and encoded land on the Hub **continuously**, local
-disk never fills, and it's resumable per shard. Target ≈**3,200 h** total (see §Hours below).
+## 4. Build the training manifest (from local shards; content-dedups)
 
 ```bash
-# ONE script for every Hindi HF source (FLEURS, Common Voice, Shrutilipi, IndicVoices,
-# Kathbath). Continues on error. Auto-detects audio/text columns. Default = download→encode→push.
-bash scripts/gather_all.sh
-# RAW_ONLY=1 bash scripts/gather_all.sh                    # skip encoder (raw push only)
-# ONLY=fleurs_hi,shrutilipi_hi bash scripts/gather_all.sh  # subset
-
-# or one source by hand:
-python scripts/11_shard_pipeline.py --config configs/gpu.yaml --hf fleurs_hi --shard-size 500
-# any HF dataset (columns auto-detected):
-# python scripts/11_shard_pipeline.py --config configs/gpu.yaml --hf-id ai4bharat/Shrutilipi --hf-config hindi --domain news --shard-size 500
-# (OPTIONAL) local <name>.wav + <name>.txt pairs:
-# python scripts/11_shard_pipeline.py --config configs/gpu.yaml --local-dir /data/hi_medical --domain medical --shard-size 500
-
-# PARALLEL across 2 GPUs (interleaved shards run "meanwhile"):
-CUDA_VISIBLE_DEVICES=0 python scripts/11_shard_pipeline.py --config configs/gpu.yaml --hf-id ai4bharat/Shrutilipi --hf-config hindi --shard-size 500 --shard-start 0 --stride 2 &
-CUDA_VISIBLE_DEVICES=1 python scripts/11_shard_pipeline.py --config configs/gpu.yaml --hf-id ai4bharat/Shrutilipi --hf-config hindi --shard-size 500 --shard-start 1 --stride 2 &
-wait
+python scripts/12_build_manifest.py --config configs/en.yaml --out data/manifests/train.jsonl
 ```
-Each shard pushes `raw/<shard>/*.wav` + `encoded/<shard>/*.npy` + manifest to
-`anuj-inavlabs/kupe-hi-asr-data`, records hours in the ledger, then flushes local files.
-The ledger prints cumulative hours pushed so you can watch the total climb toward ~3,200 h.
+Then in `configs/en.yaml`: `data.manifest: data/manifests/train.jsonl`,
+`data.use_cached_feats: true`.
 
-> Prefer this over the two separate steps below. The old split flow (all raw → then encode)
-> is still available if you ever want it: `scripts/01_dataprep.py` then `scripts/02_encode.py`.
-
-## 6. Data hours (what we gather + push)
-
-| Bucket | Hours | Used in |
-|---|---|---|
-| Core clean ASR | **2,500 h** | Stage A (encoder Hindi-adapt) + Stage B (Nandi transcription) |
-| Domain packs (medical/technical/support/general) | **+400 h** | Stage B joint + Stage C domain correction |
-| Floor-control (generated, §9) | **+300 h** | Stage C floor-control |
-| **Total raw pushed to HF** | **≈ 3,200 h** | |
-| Dev (held-out) | 15–20 h | early stopping |
-| Blind test (clean + spontaneous + domain) | ~25 h | final WER |
-
-Sources to fill 2,500 h: Shrutilipi (~6,400 h available) · IndicVoices · Kathbath · Vaani ·
-Spring-INX · MUCS · Common Voice · FLEURS — select the cleanest ~2,500 h via the quality gate.
-
-## 7. Check ASR data quality (per-flag/scenario/domain, Devanagari purity, dupes)
+## 5. Dataset distribution + NPZ sanity report  ← sanity check
 
 ```bash
-python scripts/09_data_quality.py --manifest data/manifests/train.jsonl
+python scripts/13_data_report.py --config configs/en.yaml \
+    --manifest data/manifests/train.jsonl --sample 500
 ```
+Prints hours by domain/split, duration histogram, transcript stats, duplicate ratio,
+and a real NPZ pass (loads sampled feats.npz, checks shape `[T,512]`, dtype, NaN/Inf,
+frame-rate vs duration). Exits non-zero on a hard problem (missing/NaN/wrong-dim feats).
 
-## 8. Tokenizer fertility (Nandi BPE on Hindi — sanity check)
+## 6. gpt-luna data generation (floor-control + domain correction)
+
+Both agents show live token/cost. Always `--mock` first (no keys) to prove the generator,
+then the real run, then GATE with the quality checker.
 
 ```bash
-python scripts/08_tokenizer_fertility.py --config configs/gpu.yaml
+# 6a. Floor-control data (conversational clips only; NPTEL/read excluded by default)
+python scripts/06_gen_fc.py --config configs/en.yaml --src data/manifests/train.jsonl \
+    --out data/manifests/fc.jsonl --mock --limit 50          # dry-run
+python scripts/06_gen_fc.py --config configs/en.yaml --src data/manifests/train.jsonl \
+    --out data/manifests/fc.jsonl --concurrency 10           # real (uses KUPE_LLM_* from .env)
+
+# 6b. Domain-correction data (Phase 5)
+python scripts/07_gen_domain.py --config configs/en.yaml --src data/manifests/train.jsonl \
+    --out data/manifests/domain.jsonl --mock --limit 100     # dry-run
+python scripts/07_gen_domain.py --config configs/en.yaml --src data/manifests/train.jsonl \
+    --out data/manifests/domain.jsonl --concurrency 10       # real
 ```
 
----
+Set `KUPE_LLM_PRICE_IN` / `KUPE_LLM_PRICE_OUT` in `.env` to see `$` in the `[cost]` lines.
 
-## 9. Generate floor-control data (audio-aware LLM agent, gpt-5.6-luna)
+## 6c. Data-quality gate (strict; exits non-zero if it fails)
 
 ```bash
-# offline dry-run first (no keys, proves the generator):
-python scripts/06_gen_fc.py --config configs/gpu.yaml --src data/manifests/train.jsonl \
-    --out data/manifests/fc.jsonl --mock --limit 200
-
-# real generation: 10 concurrent, ~22 rows/hit, resumable per batch
-python scripts/06_gen_fc.py --config configs/gpu.yaml --src data/manifests/train.jsonl \
-    --out data/manifests/fc.jsonl --concurrency 10 --rows-per-hit 22 --push
-
-# quality-gate the generated data (blocks training in CI if it fails)
-python scripts/09_data_quality.py --manifest data/manifests/fc.jsonl
+python scripts/09_data_quality.py --manifest data/manifests/fc.jsonl --lang en
+python scripts/09_data_quality.py --manifest data/manifests/domain.jsonl --kind domain --lang en
 ```
 
-## 10. Generate domain-correction data (Phase 5)
+## 7. Fetch data onto the training box (H100 / RTX Pro 6000)
+
+**Frozen-encoder training (phases 1,2,4,5) — feats only, small & fast:**
+```bash
+# grabs feats.npz + manifests into ./data (LFS, resumable, parallel)
+HF_HUB_ENABLE_HF_TRANSFER=1 huggingface-cli download anuj-inavlabs/kupe-en-asr-data \
+    --repo-type dataset --local-dir data --include "encoded/**" "ledger/**"
+python scripts/12_build_manifest.py --config configs/en.yaml --out data/manifests/train.jsonl
+python scripts/13_data_report.py --config configs/en.yaml --manifest data/manifests/train.jsonl
+```
+(`pip install hf_transfer` first for max download speed.)
+
+**Full-FT with UNFROZEN encoder (phase 3) needs RAW audio — not on the Hub yet.**
+Cached feats are frozen-encoder outputs, so backprop into the encoder can't use them.
+Recommended: keep the encoder **frozen** (reaches ~3%, no raw needed). If you truly want
+phase 3, gather a bounded subset WITH raw and flush local disk (raw wav for 4,000 h ≈
+460 GB — do a subset):
+```bash
+PUSH_RAW=1 NO_FLUSH=0 MAXH_SPONT=800 ONLY="peoples_speech" DL_WORKERS=6 \
+  CFG=configs/en.yaml nohup bash scripts/gather_all_en.sh > gather_raw.log 2>&1 &
+# then on the training box:
+HF_HUB_ENABLE_HF_TRANSFER=1 huggingface-cli download anuj-inavlabs/kupe-en-asr-data \
+    --repo-type dataset --local-dir data --include "raw/**"
+```
+
+## 8. Train (resumable; per-phase). See phases in 03_train.py.
 
 ```bash
-python scripts/07_gen_domain.py --config configs/gpu.yaml --src data/manifests/train.jsonl \
-    --out data/manifests/domain.jsonl --concurrency 10        # add --mock for offline
-python scripts/09_data_quality.py --manifest data/manifests/domain.jsonl --kind domain
+python scripts/03_train.py --config configs/en.yaml --phase 1   # projector warmup (CTC)
+python scripts/03_train.py --config configs/en.yaml --phase 2   # projector+Nandi align (frozen enc)
+python scripts/03_train.py --config configs/en.yaml --phase 4   # floor-control (needs fc.jsonl)
+python scripts/03_train.py --config configs/en.yaml --phase 5   # domain correction (needs domain.jsonl)
+# optional, needs raw audio (§7):
+python scripts/03_train.py --config configs/en.yaml --phase 3   # joint full-FT (encoder unfrozen)
+# resume:
+python scripts/03_train.py --config configs/en.yaml --phase 2 --resume auto
 ```
 
----
-
-## 11. Training — 3 stages / 5 runs (resume any run with `--resume auto`)
+## 9. Evaluate + latency
 
 ```bash
-# STAGE A — adapt the Omni SSL encoder on Hindi (our CTC head; NOT the transcript)
-python scripts/03_train.py --config configs/gpu.yaml --phase 1
-
-# STAGE B — teach Nandi to transcribe from the adapted encoder
-python scripts/03_train.py --config configs/gpu.yaml --phase 2
-python scripts/03_train.py --config configs/gpu.yaml --phase 3 --resume auto   # MAIN <5% WER gate
-
-# STAGE C — floor-control, then domain correction
-python scripts/03_train.py --config configs/gpu.yaml --phase 4 --set data.manifest=data/manifests/fc.jsonl
-python scripts/03_train.py --config configs/gpu.yaml --phase 5 --set data.manifest=data/manifests/domain.jsonl
-
-# push a finished run + its best model to the Hub
-python scripts/hf_sync.py push --config configs/gpu.yaml --what run   --run <run_name>
-python scripts/hf_sync.py push --config configs/gpu.yaml --what model --run <run_name>
+python scripts/04_eval.py --config configs/en.yaml --ckpt checkpoints/<run>/checkpoint-XXXX --split test
+python scripts/10_latency_bench.py --config configs/en.yaml --ckpt checkpoints/<run>/checkpoint-XXXX
 ```
 
-Resume examples:
-```bash
-python scripts/03_train.py --config configs/gpu.yaml --phase 3 --resume auto           # latest ckpt of this phase
-python scripts/03_train.py --config configs/gpu.yaml --phase 3 --resume <run_name>      # a specific run
-```
-
-## 12. Evaluation — WER/CER (Nandi), CTC-diagnostic WER, floor-control F1 + false-fire
+## 10. Inference (offline + streaming with controllable floor control)
 
 ```bash
-python scripts/04_eval.py --config configs/gpu.yaml --ckpt checkpoints/<run>/checkpoint-XXXX --split test
-python scripts/04_eval.py --config configs/gpu.yaml --ckpt checkpoints/<run>/checkpoint-XXXX --split val
+python scripts/05_infer.py --config configs/en.yaml --ckpt <ckpt> --wav clip.wav
+python scripts/05_infer.py --config configs/en.yaml --ckpt <ckpt> --wav clip.wav --stream \
+    --bc-bias 0.0 --think-bias 0.0 --temperature 1.0        # dial floor-control at inference
 ```
 
-## 13. Latency benchmark — back the <100 ms claim with p50/p95 numbers
+## 11. Sync artifacts to the Hub (any stage)
 
 ```bash
-python scripts/10_latency_bench.py --config configs/gpu.yaml --chunk-ms 80
+python scripts/hf_sync.py push --config configs/en.yaml --what manifests
+python scripts/hf_sync.py push --config configs/en.yaml --what run   --run <run_name>
+python scripts/hf_sync.py push --config configs/en.yaml --what model --run <run_name>
 ```
-
-## 14. Inference
-
-```bash
-# offline: authoritative transcript (Nandi) + CTC diagnostic
-python scripts/05_infer.py --config configs/gpu.yaml --ckpt <ckpt> --wav clip.wav
-
-# streaming: per-chunk records (corrected transcript = Nandi, + backchannel/thinking/eos/silence)
-python scripts/05_infer.py --config configs/gpu.yaml --ckpt <ckpt> --wav clip.wav --stream
-
-# dial floor-control at inference (no retraining):
-python scripts/05_infer.py --config configs/gpu.yaml --ckpt <ckpt> --wav clip.wav --stream --bc-bias 1.0
-python scripts/05_infer.py --config configs/gpu.yaml --ckpt <ckpt> --wav clip.wav --stream --temperature 0.7 --no-think
-```
-
----
-
-## 15. Cross-machine resume (pull state, continue)
-
-```bash
-python scripts/hf_sync.py pull --config configs/gpu.yaml --what manifests
-python scripts/hf_sync.py pull --config configs/gpu.yaml --what feats
-python scripts/03_train.py --config configs/gpu.yaml --phase 3 --resume auto
-```
-
-## 16. Tests + rebuild the proposal PDF
-
-```bash
-python tests/test_token_extension.py      # Nandi factorized/tied vocab extension
-python tests/test_causal_mask.py          # streaming mask: no future leakage
-python paper/make_figs.py && (cd paper && tectonic paper.tex)   # -> paper/paper.pdf
-```
-
----
-
-## One-shot: full local dry-run of the whole flow (offline, tiny models)
-
-```bash
-bash run_smoke.sh                                                   # end-to-end sanity
-python scripts/08_tokenizer_fertility.py --config configs/smoke.yaml
-python scripts/10_latency_bench.py       --config configs/smoke.yaml
-```
-
-## Key config knobs (edit configs/gpu.yaml)
-- `backend: real` — use omniASR_W2V + Nandi (vs `tiny` for smoke).
-- `base.encoder_type: omni_w2v` (SSL only) — or `fastconformer` fallback if WER stalls.
-- `audio.n_codes` — 0 = continuous only (recommended); >0 = discrete audio tokens.
-- `stream.chunk_ms: 80`, `stream.endpoint_mode: predictive`, `audio.right_chunks: 0` — latency.
-- `train.eos_lead_ms: 160` — predictive end-of-turn labels.
-- `data.min_hours` — refuses to launch the main run on too little data.
-- `train.push_to_hub`, `train.push_checkpoints` — Hub sync during training.
