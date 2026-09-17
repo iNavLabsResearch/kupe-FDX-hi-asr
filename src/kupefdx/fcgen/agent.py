@@ -209,7 +209,8 @@ def _mock_rows(batch: list[dict], n_rows: int) -> list[dict]:
 
 
 # ---- shared diagnostics so a silent 0-rows run is impossible ----
-_DIAG = {"parsed": 0, "kept": 0, "dropped": 0, "reasons": {}, "raw_dumped": False}
+_DIAG = {"parsed": 0, "kept": 0, "dropped": 0, "reasons": {}, "raw_dumped": False,
+         "hits_done": 0}
 _DLOCK = threading.Lock()
 
 
@@ -221,14 +222,17 @@ def _diag_drop(reason):
 
 
 def _one_hit(batch, n_rows, cfg, mock) -> list[dict]:
+    t0 = time.time()
     if mock:
         rows = _mock_rows(batch, n_rows)
+        n_parsed = len(rows)
     else:
         scen = sample_scenarios(n_rows)
         msgs = [{"role": "system", "content": SYSTEM},
                 {"role": "user", "content": build_user_prompt(batch, n_rows, scen)}]
         raw = ""
         rows = []
+        err = None
         for attempt in range(3):
             try:
                 raw = call_llm(msgs, cfg)
@@ -236,8 +240,16 @@ def _one_hit(batch, n_rows, cfg, mock) -> list[dict]:
                 if rows:
                     break
             except Exception as e:
+                err = e
                 log.warning("LLM hit failed (attempt %d): %s", attempt + 1, e)
                 time.sleep(2 * (attempt + 1))
+        n_parsed = len(rows)
+        if not rows:                              # every hit result is logged, pass or fail
+            with _DLOCK:
+                _DIAG["hits_done"] += 1
+                hd = _DIAG["hits_done"]
+            log.info("hit %d: FAIL 0 rows in %.1fs (%s)", hd, time.time() - t0,
+                     type(err).__name__ if err else "empty/parse")
         if not rows:                              # parse failed -> show WHY, once
             with _DLOCK:
                 if not _DIAG["raw_dumped"] and raw:
@@ -262,6 +274,13 @@ def _one_hit(batch, n_rows, cfg, mock) -> list[dict]:
                     _DIAG["raw_dumped"] = True
                     log.warning("FC first invalid row dropped (%s). ROW was:\n%s",
                                 e, json.dumps(r)[:600])
+    if not mock:
+        with _DLOCK:
+            _DIAG["hits_done"] += 1
+            hd, kept, drop = _DIAG["hits_done"], _DIAG["kept"], _DIAG["dropped"]
+        log.info("hit %d: OK kept %d/%d rows in %.1fs | totals kept=%d dropped=%d out=%d tok",
+                 hd, len(valid), n_parsed, time.time() - t0, kept, drop,
+                 _TOK["in"] + _TOK["out"])
     return valid
 
 
