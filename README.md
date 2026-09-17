@@ -11,6 +11,35 @@ Config: [`configs/en.yaml`](configs/en.yaml) (real run) · [`configs/smoke.yaml`
 
 ---
 
+## The project in short
+
+A **speech-LLM** for real-time English conversation. We take a strong **pretrained
+FastConformer encoder** (kept frozen) and teach a small **Nandi-Mini-150M** decoder to read
+its features — LLaVA-style — so we get accurate ASR *plus* the turn-taking signals a
+voice agent needs, all in one streaming model.
+
+- **What it outputs:** the transcript, inline **floor-control** tokens (`<BC>` backchannel ·
+  `<THINK>` thinking · `<EOS_SPEECH>` turn-end · `<SILENCE>`), and **domain-corrected** text.
+- **How it's built (5 phases):** ①CTC/projector warm-up → ②projector+Nandi alignment →
+  ③(optional) joint fine-tune with the encoder unfrozen, gated at <5% WER →
+  ④floor-control → ⑤domain correction. Phases 1,2,4,5 run on **cached feats** (cheap, no raw
+  audio); phase 3 is the only one that needs raw wavs.
+- **Data:** ~**3,100 h** of real English speech (LibriSpeech, People's Speech, VoxPopuli,
+  GigaSpeech, MLS) encoded to feats and stored on the Hub. Floor-control + domain-correction
+  training data is **LLM-generated** (Krutrim `gemma-4-31b-it`) from those clips by
+  [`gen_data.py`](scripts/gen_data.py).
+- **Everything is resumable and mirrored to the Hub** — shard ledgers, generated manifests
+  (auto-synced during generation), and training checkpoints (auto-synced on every save).
+- **Target:** ~3% WER on clean English, streaming, with correct floor-control behavior.
+
+**Current data status:** ~3,115 h encoded on the Hub · `fc.jsonl` ≈ 21.4k floor-control rows
+· `domain.jsonl` ≈ 2.1k domain-correction rows (no-op rows filtered out). Gate everything
+with `check_ready.py` (§4) before a run. Two known caveats when generated on a *feats-only*
+box: FC pause-timing is duration-only (regenerate on a box with `data/raw/` for real
+acoustic grounding), and the `expression` scenario is under-produced by the small LLM.
+
+---
+
 ## 0. Clone, environment, install
 
 ```bash
