@@ -23,17 +23,19 @@ EXTRA=""
 # DL_WORKERS parallel download threads per source (disjoint file-shards → 1 GPU encoder).
 # Set DL_WORKERS=4 (default) to cut download-bound wall-clock ~4×. MAXH_* cap hours/source.
 DATASETS=(
-  "openslr/librispeech_asr|clean|train.100|read_us|0"          # ~100 h (already done → hub-sync skips)
-  "openslr/librispeech_asr|clean|train.360|read_us|0"          # ~360 h
-  "openslr/librispeech_asr|other|train.500|read_us|0"          # ~500 h
-  "MLCommons/peoples_speech|clean|train|spontaneous|${MAXH_SPONT:-500}"       # spontaneous (done)
-  "parler-tts/mls_eng|-|train|read_audiobook|${MAXH_MLS:-1500}"               # MLS English (ungated, fast)
-  "facebook/voxpopuli|en|train|accented|${MAXH_ACCENT:-500}"                  # accented English
+  "openslr/librispeech_asr|clean|train.100|read_us|0"          # ~100 h (done → hub-sync skips)
+  "openslr/librispeech_asr|clean|train.360|read_us|0"          # ~360 h (done)
+  "openslr/librispeech_asr|other|train.500|read_us|0"          # ~500 h (done)
+  "MLCommons/peoples_speech|clean|train|spontaneous|${MAXH_SPONT:-2500}"      # REAL varied speech (main lever)
+  "facebook/voxpopuli|en|train|accented|${MAXH_ACCENT:-500}"                  # REAL parliamentary, accented
+  "espnet/yodas2|en000|train|youtube_natural|${MAXH_YODAS:-500}"             # REAL YouTube (optional; gated, noisier labels)
 )
-# ~4,000 h mix: LibriSpeech ~960 + People's Speech 500 + MLS English 1500 + VoxPopuli 500.
-# GigaSpeech dropped — its podcast segments are heavily filtered (kept_h≈0.5), so slow per kept
-# hour. MLS English (LibriVox, ~44k h available) streams clean and fast like LibriSpeech.
-# NOTE: ai4bharat/NPTEL is an En→Indic TRANSLATION dataset (no ASR audio) — removed.
+# ~4,000 h of REAL human speech: LibriSpeech ~960 + People's Speech (raise cap) + VoxPopuli 500.
+# People's Speech is the bulk lever — real, varied, fast (kept_h≈1.9), NOT robotic read speech.
+# To reach 4000h: MAXH_SPONT=2500 gives PS ~2500h → 960+2500+500 ≈ 3960h.
+# YODAS2 is OFF by default (MAXH_YODAS=0); enable it for natural conversational diversity.
+# Dropped: MLS English (real, but read-audiobook style), GigaSpeech (slow, kept_h≈0.5),
+#          ai4bharat/NPTEL (En→Indic translation, no ASR audio).
 # NOTE: ai4bharat/Svarah (9.6 h Indian-English) is an EVAL benchmark — do NOT train on it;
 #       use it as a held-out Indian-accent test set for scripts/04_eval.py.
 
