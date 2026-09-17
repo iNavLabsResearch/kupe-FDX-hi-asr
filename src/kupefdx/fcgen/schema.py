@@ -152,7 +152,7 @@ _EMO = ("haha", "oh no", "ugh", "wow", "whoa", "yikes", "phew", "aw", "hahaha")
 
 
 def _reconcile_scenario(row: dict) -> None:
-    """gpt-luna sometimes mislabels (e.g. 'clean_end_of_speech' with no <EOS_SPEECH> placed).
+    """The LLM sometimes mislabels (e.g. 'clean_end_of_speech' with no <EOS_SPEECH> placed).
     Set the scenario from the flags actually present, so the label never lies and the realized
     distribution is honest."""
     has = set(row.get("flags", []))

@@ -119,6 +119,32 @@ def _save_ckpt(path, model, opt, sched, step, cfg, wandb_id):
     model.save(path, cfg)
 
 
+def _push_ckpt(cfg, ckpt_path, run_name, blocking=False):
+    """Mirror a just-saved checkpoint to the runs repo so progress is never lost. Periodic
+    pushes run in a background daemon thread (never block or crash training); the final push
+    is blocking so it completes before the process exits. No-op unless cfg.train.push_to_hub
+    is set and a runs repo is configured."""
+    if not bool(getattr(cfg.train, "push_to_hub", False)) or not getattr(cfg.repos, "runs", None):
+        return
+
+    def _do():
+        try:
+            from .env import ensure_repo, hf_login, upload_folder
+            hf_login(); ensure_repo(cfg.repos.runs, "model")
+            dest = f"runs/{run_name}/{os.path.basename(ckpt_path)}"
+            upload_folder(ckpt_path, cfg.repos.runs, "model", path_in_repo=dest,
+                          commit_message=f"ckpt {os.path.basename(ckpt_path)}")
+            log.info("↑ checkpoint synced -> %s:%s", cfg.repos.runs, dest)
+        except Exception as e:
+            log.warning("checkpoint Hub sync failed (checkpoint safe locally): %s", e)
+
+    if blocking:
+        _do()
+    else:
+        import threading
+        threading.Thread(target=_do, daemon=True).start()
+
+
 def _latest_ckpt(out_dir):
     cks = glob.glob(os.path.join(out_dir, "checkpoint-*"))
     cks = [c for c in cks if os.path.exists(os.path.join(c, "state.pt"))]
@@ -226,14 +252,18 @@ def train(cfg, phase: int, resume: str | None = None) -> str:
                 _do_eval(model, va_rows, coll, cfg, step, wb, mode)
                 model.train()
             if save_steps and step % save_steps == 0:
-                _save_ckpt(_ckpt_dir(out_dir, step), model, opt, sched, step, cfg, wandb_id)
+                ck = _ckpt_dir(out_dir, step)
+                _save_ckpt(ck, model, opt, sched, step, cfg, wandb_id)
                 log.info("saved checkpoint step %d", step)
+                _push_ckpt(cfg, ck, run_name)
             if step >= total_steps:
                 break
         if step >= total_steps:
             break
 
-    _save_ckpt(_ckpt_dir(out_dir, step), model, opt, sched, step, cfg, wandb_id)
+    ck = _ckpt_dir(out_dir, step)
+    _save_ckpt(ck, model, opt, sched, step, cfg, wandb_id)
+    _push_ckpt(cfg, ck, run_name, blocking=True)
     rep = _do_eval(model, va_rows, coll, cfg, step, wb, mode, final=True)
     _record_run(cfg, run_name, phase, "done", rep)
     _phase_verdict(cfg, phase, rep)

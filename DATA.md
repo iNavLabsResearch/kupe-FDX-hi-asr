@@ -163,36 +163,38 @@ contexts.
 
 ## 7. The generation agent
 
-`src/kupefdx/fcgen/agent.py` — provider-agnostic (any OpenAI-compatible endpoint: Sarvam,
-OpenAI, vLLM). Set `KUPE_LLM_BASE_URL`, `KUPE_LLM_API_KEY`, `KUPE_LLM_MODEL`.
+`src/kupefdx/fcgen/generate.py` — one module, provider-agnostic (any OpenAI-compatible
+endpoint; default Krutrim `gemma-4-31b-it`). Set `KUPE_LLM_BASE_URL`, `KUPE_LLM_API_KEY`,
+`KUPE_LLM_MODEL`. It produces **both** floor-control (`generate_fc`) and domain-correction
+(`generate_domain`) rows through the same request loop.
 
 - **Audio-aware:** each clip's wav is probed (`audio_probe.probe`) into a compact text
   **audio card** (duration, pause list with timings, trailing silence, speech-rate). The
   agent grounds every row in that card — it cannot invent pauses that contradict the audio.
 - **~22 rows per LLM hit**, `clips_per_hit=5` clips per prompt (configurable).
-- **Concurrency 10** via a thread pool, with a **tqdm** progress bar.
-- **Resumable:** a `ShardLedger` marks each batch done; a re-run skips finished batches, and
-  rows are appended to `fc.jsonl` after every hit so a crash loses nothing.
+- **SSE streaming** with a **colored per-request line** (green OK / red FAIL, latency,
+  rows kept, running token/cost). `--show-stream` prints one call's live token stream.
+- **Resumable:** a `ShardLedger` marks each batch done; a re-run skips finished batches,
+  rows are appended after every hit, and the manifest is mirrored to the Hub every
+  `--sync-every` requests — a crash or dropped SSH loses nothing.
 - **Validated + rebalanced:** every row passes `schema.validate_row`; the corpus is capped to
   the target distribution before writing.
 - **`--mock`** generates deterministic, schema-valid rows offline (no keys) — used by the
   smoke test to exercise the whole path.
 
-### Run it
+### Run it (FC + domain in one command)
 
 ```bash
 # offline dry-run (proves the generator end to end, no keys)
-python scripts/06_gen_fc.py --config configs/gpu.yaml \
-    --src data/manifests/train.jsonl --out data/manifests/fc.jsonl --mock --limit 200
+python scripts/gen_data.py --config configs/en.yaml \
+    --src data/manifests/train.jsonl --mock --limit 200 --no-push
 
-# real generation
-export KUPE_LLM_BASE_URL=... KUPE_LLM_API_KEY=... KUPE_LLM_MODEL=...
-python scripts/06_gen_fc.py --config configs/gpu.yaml \
-    --src data/manifests/train.jsonl --out data/manifests/fc.jsonl \
-    --concurrency 10 --rows-per-hit 22
+# real generation — both sets, high concurrency, auto-synced to the Hub
+python scripts/gen_data.py --config configs/en.yaml \
+    --src data/manifests/train.jsonl --concurrency 40 --sync-every 25
 
 # then train the floor controller on it (ASR mixed in for anti-forgetting)
-python scripts/03_train.py --config configs/gpu.yaml --phase 4 \
+python scripts/03_train.py --config configs/en.yaml --phase 4 \
     --set data.manifest=data/manifests/fc.jsonl
 ```
 
@@ -302,7 +304,7 @@ defaults come from the `SURFACES` inventory.
 
 ## 10. Domain-correction training record (Phase 5)
 
-Format (as specified) and how it maps to a training row (`fcgen/domain.py`):
+Format (as specified) and how it maps to a training row (`fcgen/generate.py`):
 
 ```json
 {
@@ -321,4 +323,4 @@ Mapping: `text` = `omni_raw_transcript` (CTC / raw-acoustic target), `target_seq
 `corrected_transcript` (Nandi's target), `context`+`domain` become the decoder prefix,
 `correction_spans`/`chunk_boundaries_ms` are provenance. **Clean split:** CTC learns what
 the audio literally says; Nandi learns to correct it from domain + context. Generate with
-`scripts/07_gen_domain.py` (mock or real LLM).
+`scripts/gen_data.py --only domain` (mock or real LLM).

@@ -53,7 +53,7 @@ source .venv/bin/activate
 python scripts/12_build_manifest.py --config configs/en.yaml --out data/manifests/train.jsonl
 # if that still says no manifests (you flushed to Hub):
 python scripts/12_build_manifest.py --config configs/en.yaml --out data/manifests/train.jsonl --from-hub
-python scripts/13_data_report.py --config configs/en.yaml --manifest data/manifests/train.jsonl --sample 500
+python scripts/check_ready.py --config configs/en.yaml --skip-gen
 ```
 
 People's Speech never ran (two overlapping gathers stole the GPU for VoxPopuli). After
@@ -122,43 +122,32 @@ python scripts/12_build_manifest.py --config configs/en.yaml --out data/manifest
 Then in `configs/en.yaml`: `data.manifest: data/manifests/train.jsonl`,
 `data.use_cached_feats: true`.
 
-## 5. Dataset distribution + NPZ sanity report  ← sanity check
+## 5. LLM data generation — ONE command (floor-control + domain)
+
+`gen_data.py` makes **both** fc.jsonl and domain.jsonl. Colored per-request output (green
+OK / red FAIL), live token/cost, rows streamed to disk, auto-synced to the Hub every
+`--sync-every` requests. Provider = Krutrim `gemma-4-31b-it` (from `.env`). Resumable.
 
 ```bash
-python scripts/13_data_report.py --config configs/en.yaml \
-    --manifest data/manifests/train.jsonl --sample 500
+# dry-run first (offline, no keys)
+python scripts/gen_data.py --config configs/en.yaml --src data/manifests/train.jsonl --mock --limit 50 --no-push
+# real run — both sets, high concurrency, mirrors to Hub as it goes
+python scripts/gen_data.py --config configs/en.yaml --src data/manifests/train.jsonl --concurrency 40 --sync-every 25
+# watch one call's live SSE stream
+python scripts/gen_data.py --config configs/en.yaml --src data/manifests/train.jsonl --only fc --limit 3 --show-stream --no-push
 ```
-Prints hours by domain/split, duration histogram, transcript stats, duplicate ratio,
-and a real NPZ pass (loads sampled feats.npz, checks shape `[T,512]`, dtype, NaN/Inf,
-frame-rate vs duration). Exits non-zero on a hard problem (missing/NaN/wrong-dim feats).
+Flags: `--only fc|domain|both` · `--limit` · `--rows-per-hit` · `--clips-per-hit`
+· `--concurrency` · `--sync-every` · `--no-push`. Set `KUPE_LLM_PRICE_IN/OUT` in `.env`
+to see `$` cost.
 
-## 6. gpt-luna data generation (floor-control + domain correction)
-
-Both agents show live token/cost. Always `--mock` first (no keys) to prove the generator,
-then the real run, then GATE with the quality checker.
+## 6. Readiness gate — ONE command (data + quality + generated sets)
 
 ```bash
-# 6a. Floor-control data (conversational clips only; NPTEL/read excluded by default)
-python scripts/06_gen_fc.py --config configs/en.yaml --src data/manifests/train.jsonl \
-    --out data/manifests/fc.jsonl --mock --limit 50          # dry-run
-python scripts/06_gen_fc.py --config configs/en.yaml --src data/manifests/train.jsonl \
-    --out data/manifests/fc.jsonl --concurrency 10           # real (uses KUPE_LLM_* from .env)
-
-# 6b. Domain-correction data (Phase 5)
-python scripts/07_gen_domain.py --config configs/en.yaml --src data/manifests/train.jsonl \
-    --out data/manifests/domain.jsonl --mock --limit 100     # dry-run
-python scripts/07_gen_domain.py --config configs/en.yaml --src data/manifests/train.jsonl \
-    --out data/manifests/domain.jsonl --concurrency 10       # real
+python scripts/check_ready.py --config configs/en.yaml            # train + fc + domain
+python scripts/check_ready.py --config configs/en.yaml --skip-gen # base corpus only
 ```
-
-Set `KUPE_LLM_PRICE_IN` / `KUPE_LLM_PRICE_OUT` in `.env` to see `$` in the `[cost]` lines.
-
-## 6c. Data-quality gate (strict; exits non-zero if it fails)
-
-```bash
-python scripts/09_data_quality.py --manifest data/manifests/fc.jsonl --lang en
-python scripts/09_data_quality.py --manifest data/manifests/domain.jsonl --kind domain --lang en
-```
+Checks encoded-corpus hours + NPZ shape/NaN sanity + dup ratio, and both generated
+manifests' schema/scenario-mix/dupes. Exits non-zero if anything is unfit.
 
 ## 7. Fetch data onto the training box (H100 / RTX Pro 6000)
 
@@ -168,7 +157,7 @@ python scripts/09_data_quality.py --manifest data/manifests/domain.jsonl --kind 
 HF_HUB_ENABLE_HF_TRANSFER=1 huggingface-cli download anuj-inavlabs/kupe-en-asr-data \
     --repo-type dataset --local-dir data --include "encoded/**" "ledger/**"
 python scripts/12_build_manifest.py --config configs/en.yaml --out data/manifests/train.jsonl
-python scripts/13_data_report.py --config configs/en.yaml --manifest data/manifests/train.jsonl
+python scripts/check_ready.py --config configs/en.yaml --skip-gen
 ```
 (`pip install hf_transfer` first for max download speed.)
 

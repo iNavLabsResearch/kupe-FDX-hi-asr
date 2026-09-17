@@ -86,14 +86,14 @@ def _gen_fc(cfg, manifest: str) -> str:
     print one sample row so the format is visible."""
     import json
 
-    from .fcgen.agent import generate
+    from .fcgen.generate import generate_fc
     from .fcgen.audio_probe import audio_card, probe
     from .fcgen.scenarios import rebalance
     rows = read_manifest(manifest)
     clips = [{"id": r["id"], "audio": r["audio"], "transcript": r["text"],
               "domain": r["domain"], "features": (f := probe(r["audio"])),
               "card": audio_card(f, r["text"])} for r in rows]
-    fc = rebalance(generate(clips, rows_per_hit=12, clips_per_hit=4, concurrency=4, mock=True))
+    fc = rebalance(generate_fc(clips, rows_per_hit=12, clips_per_hit=4, concurrency=4, mock=True))
     for i, r in enumerate(fc):
         r["split"] = "train" if i < int(0.9 * len(fc)) else "val"
     out = os.path.join(os.path.dirname(manifest), "fc.jsonl")
