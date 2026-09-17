@@ -11,31 +11,12 @@ frozen encoder) for a big speedup.
 """
 from __future__ import annotations
 
-import json
-
 import numpy as np
 from torch.utils.data import Dataset
 
 from .audio import load_wav
 from .constants import SPLIT_TEST, SPLIT_TRAIN, SPLIT_VAL
-
-
-def read_manifest(path: str) -> list[dict]:
-    rows = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                rows.append(json.loads(line))
-    return rows
-
-
-def write_manifest(path: str, rows: list[dict]) -> None:
-    import os
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        for r in rows:
-            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+from .jsonl import read_manifest, write_manifest  # re-export
 
 
 class ManifestDataset(Dataset):

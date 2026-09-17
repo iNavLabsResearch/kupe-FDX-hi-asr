@@ -21,8 +21,8 @@ import numpy as np
 
 import _bootstrap  # noqa: F401
 from kupefdx.config import load_config
-from kupefdx.dataset import read_manifest
 from kupefdx.env import log
+from kupefdx.jsonl import read_manifest
 
 FPS = 12.5  # FastConformer: 12.5 frames/s (80 ms/frame)
 

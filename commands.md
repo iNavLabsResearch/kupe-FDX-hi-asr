@@ -29,9 +29,49 @@ set -a && . ./.env && set +a
 python scripts/00_smoke.py --config configs/smoke.yaml
 ```
 
+## 1b. Box is full / `No usable temporary directory` / `no shard manifests`
+
+This is the gather box filling itself. Encoded shards are **already on the Hub** — delete
+local caches, then build the manifest. Do this **before** `git pull` if pull itself fails.
+
+```bash
+# 1. kill stragglers (bash wrappers survive a python pkill — kill both)
+pkill -9 -f 11_shard_pipeline.py; pkill -9 -f gather_all_en.sh; sleep 2
+jobs -l; ps aux | grep -E '[1]1_shard_pipeline|[g]ather_all_en'   # must be empty
+
+# 2. free disk (source caches + raw wavs + leftover upload staging). KEEP data/encoded/
+#    if you gathered with NO_FLUSH=1 and want a local train.jsonl without re-download.
+df -h
+rm -rf ~/.cache/huggingface/datasets ~/.cache/huggingface/hub/datasets--*
+rm -rf data/raw data/hubbatch_* data/hubup_* /tmp/* /var/tmp/*
+df -h   # need ≳20G free to import python / git pull
+
+git pull
+source .venv/bin/activate
+
+# 3. build train.jsonl from local --no-flush shards (shards/<sid>/_hub/) OR from Hub
+python scripts/12_build_manifest.py --config configs/en.yaml --out data/manifests/train.jsonl
+# if that still says no manifests (you flushed to Hub):
+python scripts/12_build_manifest.py --config configs/en.yaml --out data/manifests/train.jsonl --from-hub
+python scripts/13_data_report.py --config configs/en.yaml --manifest data/manifests/train.jsonl --sample 500
+```
+
+People's Speech never ran (two overlapping gathers stole the GPU for VoxPopuli). After
+disk is free, gather it **alone**, **no** `NO_FLUSH` (Hub already has everything else):
+
+```bash
+pkill -9 -f 11_shard_pipeline.py; sleep 2
+ENCODE_BATCH=96 MAX_BATCH_SEC=400 MAXH_SPONT=2500 ONLY="peoples_speech" \
+  DL_WORKERS=6 NO_FLUSH=0 RAW_ONLY=0 CFG=configs/en.yaml \
+  nohup bash scripts/gather_all_en.sh > gather.log 2>&1 &
+tail -f gather.log
+```
+
 ## 2. Gather data (fast: parallel download → GPU encode → batched Hub push)
 
 Always run detached so a dropped SSH can't kill it; only ONE job at a time.
+`NO_FLUSH=1` keeps every shard on disk (~tens of GB per 1k hours) and will fill the box —
+default is flush-after-upload. Pull feats back in §7 if you train on another machine.
 
 ```bash
 pkill -9 -f 11_shard_pipeline.py; sleep 2
@@ -39,14 +79,15 @@ ps aux | grep -c "[1]1_shard_pipeline.py"   # must print 0
 
 ENCODE_BATCH=96 MAX_BATCH_SEC=400 MAXH_SPONT=2500 \
   ONLY="peoples_speech voxpopuli" DL_WORKERS=6 \
-  NO_FLUSH=1 RAW_ONLY=0 CFG=configs/en.yaml \
+  NO_FLUSH=0 RAW_ONLY=0 CFG=configs/en.yaml \
   nohup bash scripts/gather_all_en.sh > gather.log 2>&1 &
 tail -f gather.log
 ```
 
 Knobs: `DL_WORKERS` parallel download threads · `ENCODE_BATCH`/`MAX_BATCH_SEC` GPU batch
 · `MAXH_SPONT`/`MAXH_ACCENT`/`MAXH_YODAS` per-source hour caps · `ONLY="id1 id2"` pick
-sources · `NO_FLUSH=1` keep shards on local disk (needed for §4 local build).
+sources · `NO_FLUSH=1` keep shards on local disk (needed for §4 local build, eats disk)
+· `MIN_FREE_GB=20` abort/pause when free space drops below this.
 
 Sources (all REAL human speech): LibriSpeech (done) · People's Speech (bulk, varied) ·
 VoxPopuli (accented) · YODAS2 (opt-in, gated, YouTube conversational).
@@ -70,8 +111,13 @@ PY
 
 ## 4. Build the training manifest (from local shards; content-dedups)
 
+Torch-free. Recursive glob finds `shards/<sid>/_hub/manifest.jsonl` (local) and
+`encoded/<sid>/manifest.jsonl` (Hub pull). `--from-hub` downloads manifests only.
+
 ```bash
 python scripts/12_build_manifest.py --config configs/en.yaml --out data/manifests/train.jsonl
+# or, if local shards were flushed:
+python scripts/12_build_manifest.py --config configs/en.yaml --out data/manifests/train.jsonl --from-hub
 ```
 Then in `configs/en.yaml`: `data.manifest: data/manifests/train.jsonl`,
 `data.use_cached_feats: true`.

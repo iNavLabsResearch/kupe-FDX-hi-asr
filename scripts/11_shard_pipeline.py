@@ -30,7 +30,7 @@ import _bootstrap  # noqa: F401
 from kupefdx.audio import _resample, duration_s, load_wav, save_wav
 from kupefdx.config import load_config
 from kupefdx.constants import SAMPLE_RATE, SPLIT_TEST, SPLIT_TRAIN, SPLIT_VAL
-from kupefdx.dataset import write_manifest
+from kupefdx.jsonl import write_manifest
 from kupefdx.encoders import build_encoder
 from kupefdx.env import device_auto, ensure_repo, hf_login, log, require_token, upload_file, upload_folder
 from kupefdx.ledger import ShardLedger
@@ -44,6 +44,44 @@ SOURCES = {
 
 SENTINEL = object()
 LED_LOCK = threading.Lock()   # serialize ledger writes across parallel download workers
+_LOCK_FP = None               # keep flock handle alive for process lifetime
+
+
+def _acquire_singleton(cfg):
+    """Refuse to start a second gather — two jobs on one GPU fill the disk and mix sources."""
+    global _LOCK_FP
+    os.makedirs(cfg.paths.data_dir, exist_ok=True)
+    path = os.path.join(cfg.paths.data_dir, "shardpipe.lock")
+    _LOCK_FP = open(path, "a+", encoding="utf-8")
+    try:
+        import fcntl
+        fcntl.flock(_LOCK_FP, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        _LOCK_FP.seek(0)
+        other = _LOCK_FP.read().strip() or "?"
+        raise SystemExit(
+            f"another 11_shard_pipeline.py is running ({path}: {other}).\n"
+            "  pkill -9 -f 11_shard_pipeline.py; sleep 2; ps aux | grep 11_shard_pipeline"
+        )
+    _LOCK_FP.seek(0)
+    _LOCK_FP.truncate()
+    _LOCK_FP.write(f"pid={os.getpid()}\n")
+    _LOCK_FP.flush()
+
+
+def _free_gb(path) -> float:
+    return shutil.disk_usage(path).free / (1024 ** 3)
+
+
+def _stage_payload(src, dst):
+    """Hard-link shard files into the upload staging dir (no extra disk). Falls back to copy."""
+    os.makedirs(dst, exist_ok=True)
+    for fn in os.listdir(src):
+        s, d = os.path.join(src, fn), os.path.join(dst, fn)
+        try:
+            os.link(s, d)
+        except OSError:
+            shutil.copy2(s, d)
 
 
 def _shard_stream(ds, wn, widx):
@@ -127,9 +165,6 @@ def sync_done_from_hub(led: ShardLedger, repo_id: str, src_name: str, shard_size
     except Exception as e:
         tqdm.write(f"hub sync skipped: {e}")
         return 0
-    prefix = f"encoded/{src_name}_n{shard_size}_shard_"
-    # also older naming without n{size}
-    prefix_old = f"encoded/{src_name}_shard_"
     found = set()
     for f in files:
         if "/feats.npz" in f or f.endswith(".feats.npy"):
@@ -137,7 +172,9 @@ def sync_done_from_hub(led: ShardLedger, repo_id: str, src_name: str, shard_size
             parts = f.split("/")
             if len(parts) >= 2 and parts[0] == "encoded":
                 sid = parts[1]
-                if sid.startswith(src_name):
+                # exact worker/source prefix — NOT startswith(src_name) which would
+                # let a short name steal another source's shards
+                if sid.startswith(src_name + "_n") or sid.startswith(src_name + "_shard_"):
                     found.add(sid)
     n = 0
     for sid in sorted(found):
@@ -321,12 +358,17 @@ def download_worker(a, cfg, src_name, led, dl_q: Queue, dl_bar: tqdm, err_box: l
             cid = f"{src_name}_{si:04d}_{j:06d}"
             p = os.path.join(raw_root, cid + ".wav")
             if a.min_free_gb:                       # disk backpressure: wait for uploads to drain
-                import shutil as _sh
                 waited = 0
-                while _sh.disk_usage(a_cfg.paths.data_dir).free / 2**30 < a.min_free_gb:
+                while _free_gb(cfg.paths.data_dir) < a.min_free_gb:
                     if waited == 0:
                         tqdm.write(f"disk < {a.min_free_gb}GB free — pausing download for uploads to flush")
-                    time.sleep(3); waited += 1
+                    time.sleep(3)
+                    waited += 1
+                    if waited * 3 > 1800:
+                        raise RuntimeError(
+                            f"disk still < {a.min_free_gb}GB after 30 min — "
+                            "rm -rf ~/.cache/huggingface/datasets data/raw data/hubbatch_*"
+                        )
             save_wav(p, arr)
             rows.append({"id": cid, "audio": p, "text": text, "dur": dur,
                          "domain": a.domain, "split": _split_of(cid)})
@@ -448,8 +490,8 @@ def main():
                          "(GPU encode stays a single shared consumer). Cuts wall-clock ~N× "
                          "when download-bound.")
     ap.add_argument("--no-flush", action="store_true")
-    ap.add_argument("--min-free-gb", type=float, default=0.0,
-                    help="pause downloading if local free disk drops below this (auto-backpressure)")
+    ap.add_argument("--min-free-gb", type=float, default=20.0,
+                    help="abort/pause if free disk drops below this many GB (0=disable)")
     ap.add_argument("--raw-only", action="store_true")
     ap.add_argument("--push-raw", action="store_true")
     ap.add_argument("--peek", action="store_true")
@@ -457,6 +499,20 @@ def main():
     cfg = load_config(a.config)
     if not a.hf and not a.hf_id and not a.local_dir:
         raise SystemExit("give --hf / --hf-id / --local-dir")
+    if not a.peek:
+        _acquire_singleton(cfg)
+        for junk in glob.glob(os.path.join(cfg.paths.data_dir, "hubbatch_*")) + \
+                glob.glob(os.path.join(cfg.paths.data_dir, "hubup_*")):
+            shutil.rmtree(junk, ignore_errors=True)
+        if a.min_free_gb:
+            free = _free_gb(cfg.paths.data_dir)
+            if free < a.min_free_gb:
+                raise SystemExit(
+                    f"only {free:.1f} GB free (need {a.min_free_gb:.0f}). Disk is the blocker.\n"
+                    "  rm -rf ~/.cache/huggingface/datasets ~/.cache/huggingface/hub/datasets--* \\\n"
+                    "         data/raw data/hubbatch_* data/hubup_* /tmp/* /var/tmp/*\n"
+                    "  df -h .   # then git pull and retry. Encoded shards are already on the Hub."
+                )
 
     if a.peek:
         from datasets import load_dataset
@@ -648,7 +704,7 @@ def main():
 
                 stage = tempfile.mkdtemp(prefix="hubup_", dir=cfg.paths.data_dir)
                 payload = os.path.join(stage, "payload")
-                shutil.copytree(hub, payload)
+                _stage_payload(hub, payload)   # hardlink — no extra disk
                 up_q.put((stage, sid, len(rows), hours, end_j))
 
                 enc_bar.update(len(rows))

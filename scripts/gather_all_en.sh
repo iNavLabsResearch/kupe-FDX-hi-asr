@@ -4,8 +4,9 @@
 # Resumable per shard; continue-on-error (a gated/failed source won't stop the rest).
 #
 #   RAW_ONLY=1 (default): raw audio only (fast, no encoder). RAW_ONLY=0: also encode.
-#   NO_FLUSH=1          : keep raw+encoded on local disk (single-box training).
-#   CFG=configs/en.yaml SHARD=500 RAW_ONLY=0 NO_FLUSH=1 bash scripts/gather_all_en.sh
+#   NO_FLUSH=1          : keep raw+encoded on local disk (eats tens of GB / 1k hours).
+#   MIN_FREE_GB=20      : abort if the box is fuller than this (default 20).
+#   CFG=configs/en.yaml SHARD=500 RAW_ONLY=0 NO_FLUSH=0 bash scripts/gather_all_en.sh
 set -uo pipefail
 cd "$(dirname "$0")/.."
 CFG=${CFG:-configs/en.yaml}
@@ -16,6 +17,23 @@ EXTRA=""
 [ "$RAW_ONLY" = "1" ] && EXTRA="$EXTRA --raw-only"
 [ "$NO_FLUSH" = "1" ] && EXTRA="$EXTRA --no-flush"
 [ "${PUSH_RAW:-0}" = "1" ] && EXTRA="$EXTRA --push-raw"   # also store raw wav+text on HF (~10x storage; needed only for full-FT)
+EXTRA="$EXTRA --min-free-gb ${MIN_FREE_GB:-20}"
+
+# Two gathers on one box = mixed logs, two encoders, disk full. Hard-stop.
+if pgrep -f "[1]1_shard_pipeline.py" >/dev/null 2>&1; then
+  echo "ABORT: 11_shard_pipeline.py already running. One job at a time."
+  echo "  pkill -9 -f 11_shard_pipeline.py; sleep 2"
+  echo "  ps aux | grep -c '[1]1_shard_pipeline.py'   # must print 0"
+  exit 1
+fi
+FREE_G=$(df -BG . 2>/dev/null | awk 'NR==2 {gsub(/G/,"",$4); print $4}')
+if [ -n "${FREE_G:-}" ] && [ "$FREE_G" -lt "${MIN_FREE_GB:-20}" ]; then
+  echo "ABORT: only ${FREE_G}G free (need ${MIN_FREE_GB:-20}G). Encoded data is already on the Hub."
+  echo "  rm -rf ~/.cache/huggingface/datasets ~/.cache/huggingface/hub/datasets--* \\"
+  echo "         data/raw data/hubbatch_* data/hubup_* /tmp/* /var/tmp/*"
+  echo "  df -h . && git pull"
+  exit 1
+fi
 
 # id | config | split | domain | max_hours   (config "-" = none; max_hours 0 = all)
 # Diversify accents/styles: US read, spontaneous, podcasts/audiobooks, crowd accents,
