@@ -29,15 +29,23 @@ def main():
     if not shard_manifests:
         raise SystemExit(f"no shard manifests under {enc_dir}/shards/*/manifest.jsonl "
                          "(run 11_shard_pipeline.py with --no-flush first)")
-    rows, n_feats = [], 0
+    rows, n_feats, seen, dups = [], 0, set(), 0
     for mp in shard_manifests:
         for r in read_manifest(mp):
             for key in ("feats", "codes"):            # relative -> absolute local paths
                 if r.get(key) and not os.path.isabs(r[key]):
                     r[key] = os.path.join(enc_dir, r[key])
+            # dedup by content (transcript + rounded duration) so old-namespace shards that
+            # overlap the re-encoded ones don't get trained on twice.
+            key = (r.get("text", "").strip().lower(), round(float(r.get("dur", 0)), 1))
+            if key in seen:
+                dups += 1
+                continue
+            seen.add(key)
             if r.get("feats") and os.path.isfile(r["feats"]):
                 n_feats += 1
             rows.append(r)
+    log.info("dropped %d duplicate clips (content dedup)", dups)
     write_manifest(a.out, rows)
     hrs = sum(r.get("dur", 0) for r in rows) / 3600
     log.info("consolidated %d shard manifests -> %s | %d clips | %.1f h | %d with cached feats",
