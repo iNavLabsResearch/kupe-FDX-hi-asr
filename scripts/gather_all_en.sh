@@ -26,7 +26,7 @@ DATASETS=(
   "ai4bharat/NPTEL|-|train|indian_english|1000"                      # ~1000 h INDIAN English
   "MLCommons/peoples_speech|clean|train|spontaneous|1000"           # ~1000 h spontaneous
   "speechcolab/gigaspeech|l|train|podcasts_audiobooks|1000"          # ~1000 h (gated: accept)
-  "mozilla-foundation/common_voice_17_0|en|train|accented|500"       # ~500 h crowd accents (gated)
+  "facebook/voxpopuli|en|train|accented|500"                       # ~500 h accented English (ungated; CV moved off HF)
 )
 # NOTE: ai4bharat/Svarah (9.6 h Indian-English) is an EVAL benchmark — do NOT train on it;
 #       use it as a held-out Indian-accent test set for scripts/04_eval.py.
