@@ -20,15 +20,19 @@ EXTRA=""
 # id | config | split | domain | max_hours   (config "-" = none; max_hours 0 = all)
 # Diversify accents/styles: US read, spontaneous, podcasts/audiobooks, crowd accents,
 # and INDIAN-English lectures. Total pretraining ~4,000+ h.
+# DL_WORKERS parallel download threads per source (disjoint file-shards → 1 GPU encoder).
+# Set DL_WORKERS=4 (default) to cut download-bound wall-clock ~4×. MAXH_* cap hours/source.
 DATASETS=(
-  "openslr/librispeech_asr|clean|train.100|read_us|0"          # ~100 h
+  "openslr/librispeech_asr|clean|train.100|read_us|0"          # ~100 h (already done → hub-sync skips)
   "openslr/librispeech_asr|clean|train.360|read_us|0"          # ~360 h
   "openslr/librispeech_asr|other|train.500|read_us|0"          # ~500 h
-  "ai4bharat/NPTEL|-|train|indian_english|1000"                      # ~1000 h INDIAN English
-  "MLCommons/peoples_speech|clean|train|spontaneous|1000"           # ~1000 h spontaneous
-  "speechcolab/gigaspeech|l|train|podcasts_audiobooks|1000"          # ~1000 h (gated: accept)
-  "facebook/voxpopuli|en|train|accented|500"                       # ~500 h accented English (ungated; CV moved off HF)
+  "MLCommons/peoples_speech|clean|train|spontaneous|${MAXH_SPONT:-500}"       # spontaneous
+  "speechcolab/gigaspeech|l|train|podcasts_audiobooks|${MAXH_PODCAST:-500}"   # podcasts (gated: accept)
+  "facebook/voxpopuli|en|train|accented|${MAXH_ACCENT:-500}"                  # accented English
 )
+# NOTE: ai4bharat/NPTEL is an En→Indic TRANSLATION dataset (configs en2indic/indic2en),
+#       NOT an ASR corpus — it has no training audio, so it was removed. For Indian-English
+#       pretraining audio we'd need a real speech corpus (Svarah is eval-only, 9.6 h).
 # NOTE: ai4bharat/Svarah (9.6 h Indian-English) is an EVAL benchmark — do NOT train on it;
 #       use it as a held-out Indian-accent test set for scripts/04_eval.py.
 
@@ -38,7 +42,8 @@ for entry in "${DATASETS[@]}"; do
   CFGFLAG=(--hf-config "$CFGNAME"); [ "$CFGNAME" = "-" ] && CFGFLAG=()
   python scripts/11_shard_pipeline.py --config "$CFG" \
       --hf-id "$ID" "${CFGFLAG[@]}" --split "$SPLIT" \
-      --domain "$DOMAIN" --shard-size "$SHARD" --upload-every "${UPLOAD_EVERY:-16}" --max-hours "$MAXH" $EXTRA \
+      --domain "$DOMAIN" --shard-size "$SHARD" --upload-every "${UPLOAD_EVERY:-16}" \
+      --dl-workers "${DL_WORKERS:-4}" --max-hours "$MAXH" $EXTRA \
     || echo "!! $ID failed (gated/license/column) — continuing to next source"
 done
 

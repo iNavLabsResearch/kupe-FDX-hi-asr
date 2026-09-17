@@ -43,6 +43,7 @@ SOURCES = {
 }
 
 SENTINEL = object()
+LED_LOCK = threading.Lock()   # serialize ledger writes across parallel download workers
 
 
 def _split_of(cid, val=0.02, test=0.02):
@@ -157,8 +158,14 @@ def _upload_retry(folder, repo_id, path_in_repo, msg, max_sleep=600):
 
 
 def download_worker(a, cfg, src_name, led, dl_q: Queue, dl_bar: tqdm, err_box: list,
-                    first_todo_si: int):
-    """Stream HF → write wav shards. Skips done shards without decoding audio."""
+                    first_todo_si: int, widx: int = 0, wn: int = 1):
+    """Stream HF → write wav shards. Skips done shards without decoding audio.
+
+    With wn>1 this worker takes only file-shard `widx` of `wn` (IterableDataset.shard),
+    so N workers download DISJOINT files in parallel (no duplicate bytes) into one shared
+    encode queue. Each worker has its own `src_name` namespace → resume-safe per worker.
+    """
+    max_hours = (a.max_hours / wn) if (a.max_hours and wn > 1) else a.max_hours
     try:
         raw_root = os.path.join(cfg.paths.raw_dir, "wavs", src_name)
         os.makedirs(raw_root, exist_ok=True)
@@ -214,6 +221,8 @@ def download_worker(a, cfg, src_name, led, dl_q: Queue, dl_bar: tqdm, err_box: l
                               trust_remote_code=True)
         except TypeError:
             ds = load_dataset(ds_id, cfg_name, split=split, streaming=True)
+        if wn > 1:                       # disjoint file-shard for this worker
+            ds = ds.shard(num_shards=wn, index=widx)
 
         # Jump past done prefix using stored end_j when available.
         # Hub-synced shards often lack end_j — use shard_size * n as a safe lower bound
@@ -270,7 +279,8 @@ def download_worker(a, cfg, src_name, led, dl_q: Queue, dl_bar: tqdm, err_box: l
                     for cand in (_sid(src_name, a.shard_size, si),
                                  f"{src_name}_shard_{si:05d}"):
                         if led.is_done(cand):
-                            led.mark(cand, "done", end_j=j)
+                            with LED_LOCK:
+                                led.mark(cand, "done", end_j=j)
                             break
                     si += 1
                     n_kept = 0
@@ -308,12 +318,12 @@ def download_worker(a, cfg, src_name, led, dl_q: Queue, dl_bar: tqdm, err_box: l
                 emit(si, rows, j)
                 rows, si = [], si + 1
                 skip = should_skip(si)
-            if a.max_hours and kept_h >= a.max_hours:   # per-source cap
+            if max_hours and kept_h >= max_hours:   # per-source cap (split across workers)
                 if rows:
                     emit(si, rows, j)
                     rows = []
-                tqdm.write(f"reached --max-hours {a.max_hours} for {src_name} "
-                           f"({kept_h:.1f} h) — stopping this source")
+                tqdm.write(f"reached cap {max_hours:.0f} h for {src_name} "
+                           f"({kept_h:.1f} h) — stopping this worker")
                 break
         if rows and not skip:
             emit(si, rows, j)
@@ -352,13 +362,14 @@ def upload_worker(up_q: Queue, cfg, led, total_h_box: list, enc_bar: tqdm,
         tree, sids = pending
         msg = f"encoded {sids[0][0]}..{sids[-1][0]} ({len(sids)} shards)"
         _upload_retry(tree, cfg.repos.data, "", msg)
-        for sid, n_clips, hours, end_j in sids:
-            total_h_box[0] += hours
-            meta = {"clips": n_clips, "hours": hours}
-            if end_j:
-                meta["end_j"] = end_j
-            led.mark(sid, "done", **meta)
-        led.save()
+        with LED_LOCK:
+            for sid, n_clips, hours, end_j in sids:
+                total_h_box[0] += hours
+                meta = {"clips": n_clips, "hours": hours}
+                if end_j:
+                    meta["end_j"] = end_j
+                led.mark(sid, "done", **meta)
+            led.save()
         enc_bar.set_postfix(hub_q=up_q.qsize(), pushed_h=f"{total_h_box[0]:.1f}",
                             batch=len(sids))
         tqdm.write(f"Hub ok: {len(sids)} shards in 1 commit | "
@@ -415,6 +426,10 @@ def main():
                     help="shards per Hub commit (HF limit ≈128 commits/hour)")
     ap.add_argument("--shard-start", type=int, default=0)
     ap.add_argument("--stride", type=int, default=1)
+    ap.add_argument("--dl-workers", type=int, default=1,
+                    help="parallel download threads, each on a disjoint file-shard "
+                         "(GPU encode stays a single shared consumer). Cuts wall-clock ~N× "
+                         "when download-bound.")
     ap.add_argument("--no-flush", action="store_true")
     ap.add_argument("--min-free-gb", type=float, default=0.0,
                     help="pause downloading if local free disk drops below this (auto-backpressure)")
@@ -462,7 +477,16 @@ def main():
     _suffix = "_".join(x for x in (getattr(a, "hf_config", None), getattr(a, "split", None))
                        if x and x != "-")
     src_name = f"{_base}_{_suffix}".replace("/", "_").replace(".", "").strip("_")
-    first_todo = sync_done_from_hub(led, cfg.repos.data, src_name, a.shard_size)
+    # Intra-source parallel download: N workers on disjoint file-shards. Sharding only
+    # applies to HF streaming; local-dir stays single-worker. Each worker gets its own
+    # ledger namespace so hub-sync resumes each independently.
+    wn = max(1, int(a.dl_workers)) if not a.local_dir else 1
+    if wn > 1:
+        worker_names = [f"{src_name}__w{i}x{wn}" for i in range(wn)]
+    else:
+        worker_names = [src_name]
+    first_todos = [sync_done_from_hub(led, cfg.repos.data, wnm, a.shard_size)
+                   for wnm in worker_names]
     total_h_box = [led.total_meta("hours")]
     total = _estimate_total(a)
 
@@ -475,18 +499,24 @@ def main():
     enc_bar = tqdm(total=None, unit="clip", desc="encode  ", position=1,
                    dynamic_ncols=True, file=sys.stderr, leave=True, smoothing=0.05)
 
-    t_dl = threading.Thread(
-        target=download_worker,
-        args=(a, cfg, src_name, led, dl_q, dl_bar, err_box, first_todo),
-        name="download", daemon=True,
-    )
+    dl_threads = [
+        threading.Thread(
+            target=download_worker,
+            args=(a, cfg, worker_names[i], led, dl_q, dl_bar, err_box, first_todos[i], i, wn),
+            name=f"download-{i}", daemon=True,
+        )
+        for i in range(wn)
+    ]
     t_up = threading.Thread(
         target=upload_worker,
         args=(up_q, cfg, led, total_h_box, enc_bar, a.upload_every),
         name="upload", daemon=True,
     )
-    t_dl.start()
+    for t in dl_threads:
+        t.start()
     t_up.start()
+    if wn > 1:
+        tqdm.write(f"parallel download: {wn} workers on disjoint file-shards → 1 GPU encoder")
 
     max_batch_samples = int(float(a.max_batch_sec) * SAMPLE_RATE)
     max_clips = max(1, int(a.encode_batch))
@@ -547,10 +577,14 @@ def main():
         return [out_by_path[r["audio"]] for r in rows]
 
     try:
+        sentinels = 0
         while True:
             item = dl_q.get()
             if item is SENTINEL:
-                break
+                sentinels += 1
+                if sentinels >= wn:      # all download workers finished
+                    break
+                continue
             if err_box:
                 raise err_box[0]
             si, sid, rows, hours, end_j = item
@@ -612,7 +646,8 @@ def main():
                             os.remove(p)
     finally:
         up_q.put(SENTINEL)
-        t_dl.join(timeout=5)
+        for t in dl_threads:
+            t.join(timeout=5)
         t_up.join(timeout=7200)
         dl_bar.close()
         enc_bar.close()
