@@ -456,7 +456,12 @@ def main():
 
     led = ShardLedger(os.path.join(cfg.paths.ledger_dir, "shardpipe.json"), "shardpipe",
                       repo_id=cfg.repos.data)
-    src_name = (a.hf or a.hf_id or a.local_dir).replace("/", "_")
+    # include config + split so different splits of ONE dataset don't collide in the ledger
+    # (e.g. librispeech clean/train.100 vs clean/train.360 vs other/train.500).
+    _base = (a.hf or a.hf_id or a.local_dir)
+    _suffix = "_".join(x for x in (getattr(a, "hf_config", None), getattr(a, "split", None))
+                       if x and x != "-")
+    src_name = f"{_base}_{_suffix}".replace("/", "_").replace(".", "").strip("_")
     first_todo = sync_done_from_hub(led, cfg.repos.data, src_name, a.shard_size)
     total_h_box = [led.total_meta("hours")]
     total = _estimate_total(a)
