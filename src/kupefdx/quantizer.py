@@ -1,9 +1,11 @@
-"""Discrete audio-token quantizer — k-means over encoder features -> N codes.
+"""OPTIONAL, OFF BY DEFAULT (n_codes=0) — NOT RECOMMENDED for quality.
 
-Turns continuous omniASR_W2V frames into discrete ids that live in Nandi's vocab as
-<aud_k> tokens (see vocab.py / tokens.py). Rationale (PLAN §0.2): a shared audio<->text
-embedding table generalizes floor-control signals and is what makes the trick cheap to
-port to the other 9 languages. Fit once (02_encode/fit_quantizer), then apply.
+k-means discretization of encoder features into <aud_k> vocab tokens (HuBERT-style discrete
+units). We DO NOT use this in the real recipe: the default path feeds CONTINUOUS encoder
+features to Nandi via the projector (inputs_embeds) — no discretization, zero information loss,
+exactly like frontier speech-LLMs (LLaVA / Qwen-Audio / SALMONN). Discretizing throws away
+acoustic detail and hurts WER, so it is kept only as an explicit opt-in experiment
+(audio.n_codes > 0), never on by default.
 """
 from __future__ import annotations
 

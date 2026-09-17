@@ -30,7 +30,7 @@ base:
 audio:
   projector: mlp
   proj_dropout: 0.0
-  n_codes: 16            # discrete audio-token branch ON (0 disables it)
+  n_codes: 0             # continuous soft-prompts (default). k-means discrete tokens = optional/off
   chunk_frames: 8        # block-causal streaming mask (~160 ms chunks @50fps)
   left_chunks: 1
   tiny_enc_dim: 64
