@@ -26,6 +26,7 @@ def main():
     ap.add_argument("--mock", action="store_true")
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--concurrency", type=int, default=10)
+    ap.add_argument("--no-push", action="store_true", help="do NOT auto-sync the result to the Hub")
     a = ap.parse_args()
     cfg = load_config(a.config)
 
@@ -46,6 +47,16 @@ def main():
         r["split"] = "train" if i < int(0.9 * len(existing)) else "val"
     write_manifest(a.out, existing)
     log.info("wrote %d domain-correction rows -> %s", len(existing), a.out)
+
+    if not a.no_push and not a.mock and existing:
+        try:
+            from kupefdx.env import ensure_repo, hf_login, upload_file
+            hf_login(); ensure_repo(cfg.repos.data, "dataset")
+            dest = f"manifests/{os.path.basename(a.out)}"
+            upload_file(a.out, cfg.repos.data, "dataset", dest, "sync domain data")
+            log.info("auto-synced %d rows -> %s:%s", len(existing), cfg.repos.data, dest)
+        except Exception as e:
+            log.warning("auto-sync to Hub failed (data is safe locally): %s", e)
 
 
 if __name__ == "__main__":

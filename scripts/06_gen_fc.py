@@ -18,6 +18,7 @@ per batch; optionally pushed to the Hub.
 """
 import argparse
 import os
+import time
 
 import _bootstrap  # noqa: F401
 from kupefdx.config import load_config
@@ -31,14 +32,27 @@ from kupefdx.ledger import ShardLedger
 
 
 def build_clips(src_rows, limit):
-    clips = []
-    for r in src_rows[: limit or None]:
-        if not os.path.isfile(r["audio"]):
-            continue
+    from concurrent.futures import ThreadPoolExecutor
+    rows = [r for r in src_rows[: limit or None] if os.path.isfile(r["audio"])]
+    missing = len(src_rows[: limit or None]) - len(rows)
+    n = len(rows)
+    workers = min(48, max(4, (os.cpu_count() or 8)))
+    log.info("probing %d clips for pause/timing (%d workers)%s ...", n, workers,
+             f"  [{missing} skipped: no local wav]" if missing else "")
+
+    def _one(r):
         feats = probe(r["audio"])
-        clips.append({"id": r["id"], "audio": r["audio"], "transcript": r["text"],
-                      "domain": r.get("domain", "general"), "features": feats,
-                      "card": audio_card(feats, r["text"])})
+        return {"id": r["id"], "audio": r["audio"], "transcript": r["text"],
+                "domain": r.get("domain", "general"), "features": feats,
+                "card": audio_card(feats, r["text"])}
+
+    clips, t0 = [], time.time()
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        for i, c in enumerate(ex.map(_one, rows), 1):
+            clips.append(c)
+            if i % 500 == 0 or i == n:
+                rate = i / max(1e-6, time.time() - t0)
+                log.info("  probed %d/%d clips (%.0f/s)", i, n, rate)
     return clips
 
 
@@ -58,7 +72,7 @@ def main():
     ap.add_argument("--rows-per-hit", type=int, default=22)
     ap.add_argument("--clips-per-hit", type=int, default=5)
     ap.add_argument("--concurrency", type=int, default=10)
-    ap.add_argument("--push", action="store_true")
+    ap.add_argument("--no-push", action="store_true", help="do NOT auto-sync the result to the Hub")
     # floor-control needs CONVERSATIONAL clips; lecture monologues (NPTEL) teach bad turn-taking.
     ap.add_argument("--exclude-domains", default="indian_english,read_us",
                     help="comma domains to skip for FC gen (default skips lectures + read speech)")
@@ -116,10 +130,15 @@ def main():
     log.info("flag counts: %s | no-flag rows: %d",
              dict(fc_cnt), sum(1 for r in all_rows if not r.get("flags")))
 
-    if a.push and getattr(cfg.train, "push_to_hub", False):
-        from kupefdx.env import ensure_repo, hf_login, upload_file
-        hf_login(); ensure_repo(cfg.repos.data, "dataset")
-        upload_file(a.out, cfg.repos.data, "dataset", "manifests/fc.jsonl", "sync fc data")
+    if not a.no_push and not a.mock and all_rows:
+        try:
+            from kupefdx.env import ensure_repo, hf_login, upload_file
+            hf_login(); ensure_repo(cfg.repos.data, "dataset")
+            dest = f"manifests/{os.path.basename(a.out)}"
+            upload_file(a.out, cfg.repos.data, "dataset", dest, "sync fc data")
+            log.info("auto-synced %d rows -> %s:%s", len(all_rows), cfg.repos.data, dest)
+        except Exception as e:
+            log.warning("auto-sync to Hub failed (data is safe locally): %s", e)
 
 
 if __name__ == "__main__":
