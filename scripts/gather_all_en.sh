@@ -15,6 +15,7 @@ NO_FLUSH=${NO_FLUSH:-0}
 EXTRA=""
 [ "$RAW_ONLY" = "1" ] && EXTRA="$EXTRA --raw-only"
 [ "$NO_FLUSH" = "1" ] && EXTRA="$EXTRA --no-flush"
+[ "${PUSH_RAW:-0}" = "1" ] && EXTRA="$EXTRA --push-raw"   # also store raw wav+text on HF (~10x storage; needed only for full-FT)
 
 # id | config | split | domain | max_hours   (config "-" = none; max_hours 0 = all)
 # Diversify accents/styles: US read, spontaneous, podcasts/audiobooks, crowd accents,
