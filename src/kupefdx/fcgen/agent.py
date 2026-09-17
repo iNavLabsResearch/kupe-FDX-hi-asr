@@ -83,19 +83,26 @@ def call_llm(messages, cfg, timeout=90) -> str:
               "temperature": 0.8, "max_completion_tokens": 4000}
     url = cfg["base_url"].rstrip("/") + "/chat/completions"
     hdr = {"Content-Type": "application/json", "Authorization": f"Bearer {cfg['api_key']}"}
-    for _ in range(4):
+    backoff = 5
+    for _ in range(8):
         req = urllib.request.Request(url, data=json.dumps(params).encode(), headers=hdr)
         try:
             with urllib.request.urlopen(req, timeout=timeout) as r:
                 data = json.load(r)
             break
         except urllib.error.HTTPError as e:
+            if e.code == 429:                                       # rate limited -> wait, retry
+                ra = e.headers.get("Retry-After")
+                wait = int(ra) if (ra and ra.isdigit()) else backoff
+                time.sleep(min(wait, 60)); backoff = min(backoff * 2, 60); continue
             msg = e.read().decode()[:300] if e.code == 400 else ""
             if e.code == 400 and "temperature" in msg:
                 params.pop("temperature", None); continue          # model wants default temp
             if e.code == 400 and "max_tokens" in msg and "max_completion_tokens" not in params:
                 params["max_completion_tokens"] = params.pop("max_tokens", 4000); continue
             raise
+    else:
+        raise RuntimeError("LLM call failed after retries (429/backoff exhausted)")
     u = data.get("usage", {}) or {}
     with _TLOCK:
         _TOK["in"] += int(u.get("prompt_tokens", 0))
@@ -105,14 +112,30 @@ def call_llm(messages, cfg, timeout=90) -> str:
 
 
 def parse_rows(text: str) -> list[dict]:
-    m = re.search(r"\[.*\]", text, re.DOTALL)
-    if not m:
+    if not text:
         return []
-    try:
-        rows = json.loads(m.group(0))
-        return rows if isinstance(rows, list) else []
-    except Exception:
-        return []
+    t = text.strip()
+    if t.startswith("```"):                       # strip ```json ... ``` fences
+        t = re.sub(r"^```[a-zA-Z]*\n?", "", t).rsplit("```", 1)[0]
+    # try whole thing, then an object with a rows/data key, then the first [...] block
+    for cand in (t, None):
+        if cand is None:
+            m = re.search(r"\[.*\]", t, re.DOTALL)
+            cand = m.group(0) if m else None
+        if not cand:
+            continue
+        try:
+            obj = json.loads(cand)
+        except Exception:
+            continue
+        if isinstance(obj, list):
+            return [r for r in obj if isinstance(r, dict)]
+        if isinstance(obj, dict):
+            for key in ("rows", "data", "examples", "results"):
+                if isinstance(obj.get(key), list):
+                    return [r for r in obj[key] if isinstance(r, dict)]
+            return [obj]                          # a single row object
+    return []
 
 
 def _attach_audio(row: dict, batch: list[dict], k: int) -> dict:
@@ -120,7 +143,7 @@ def _attach_audio(row: dict, batch: list[dict], k: int) -> dict:
     clip = batch[idx] if isinstance(idx, int) and 0 <= idx < len(batch) else batch[k % len(batch)]
     row.setdefault("id", f"{clip['id']}_fc{k:03d}")
     row.setdefault("domain", clip["domain"])
-    row.setdefault("lang", "hi")
+    row.setdefault("lang", "en")
     row["audio"] = clip["audio"]
     row["audio_features"] = clip["features"]
     row["provenance"] = "audio-derived-llm"
@@ -185,7 +208,18 @@ def _mock_rows(batch: list[dict], n_rows: int) -> list[dict]:
     return out
 
 
-# ---------------------------------------------------------------- orchestration
+# ---- shared diagnostics so a silent 0-rows run is impossible ----
+_DIAG = {"parsed": 0, "kept": 0, "dropped": 0, "reasons": {}, "raw_dumped": False}
+_DLOCK = threading.Lock()
+
+
+def _diag_drop(reason):
+    key = str(reason).split(":")[0][:60]
+    with _DLOCK:
+        _DIAG["dropped"] += 1
+        _DIAG["reasons"][key] = _DIAG["reasons"].get(key, 0) + 1
+
+
 def _one_hit(batch, n_rows, cfg, mock) -> list[dict]:
     if mock:
         rows = _mock_rows(batch, n_rows)
@@ -193,23 +227,41 @@ def _one_hit(batch, n_rows, cfg, mock) -> list[dict]:
         scen = sample_scenarios(n_rows)
         msgs = [{"role": "system", "content": SYSTEM},
                 {"role": "user", "content": build_user_prompt(batch, n_rows, scen)}]
+        raw = ""
+        rows = []
         for attempt in range(3):
             try:
-                rows = parse_rows(call_llm(msgs, cfg))
+                raw = call_llm(msgs, cfg)
+                rows = parse_rows(raw)
                 if rows:
                     break
             except Exception as e:
                 log.warning("LLM hit failed (attempt %d): %s", attempt + 1, e)
                 time.sleep(2 * (attempt + 1))
-        else:
+        if not rows:                              # parse failed -> show WHY, once
+            with _DLOCK:
+                if not _DIAG["raw_dumped"] and raw:
+                    _DIAG["raw_dumped"] = True
+                    log.warning("FC parse produced 0 rows. RAW model output (first 600 chars):\n%s",
+                                raw[:600])
+            _diag_drop("parse: no JSON array in response")
             return []
+        with _DLOCK:
+            _DIAG["parsed"] += len(rows)
         rows = [_attach_audio(r, batch, k) for k, r in enumerate(rows)]
     valid = []
     for r in rows:
         try:
             valid.append(validate_row(r))
+            with _DLOCK:
+                _DIAG["kept"] += 1
         except SchemaError as e:
-            log.debug("dropped invalid row: %s", e)
+            _diag_drop(e)
+            with _DLOCK:
+                if not _DIAG["raw_dumped"] and not mock:
+                    _DIAG["raw_dumped"] = True
+                    log.warning("FC first invalid row dropped (%s). ROW was:\n%s",
+                                e, json.dumps(r)[:600])
     return valid
 
 
@@ -240,9 +292,19 @@ def generate(clips: list[dict], *, rows_per_hit=22, clips_per_hit=5,
             if push_cb:
                 push_cb(rows)
             if not mock and _TOK["calls"] % 10 == 0:
-                log.info("[cost] %s | rows=%d", token_report(), len(out))
+                log.info("[live] hits=%d/%d kept=%d dropped=%d | %s",
+                         _TOK["calls"], len(batches), _DIAG["kept"], _DIAG["dropped"],
+                         token_report())
     if not mock:
-        log.info("[cost] FINAL %s | rows=%d", token_report(), len(out))
+        log.info("[cost] FINAL %s", token_report())
+        log.info("[diag] parsed=%d kept=%d dropped=%d", _DIAG["parsed"], _DIAG["kept"],
+                 _DIAG["dropped"])
+        if _DIAG["reasons"]:
+            log.info("[diag] drop reasons: %s",
+                     dict(sorted(_DIAG["reasons"].items(), key=lambda x: -x[1])))
+        if _DIAG["kept"] == 0:
+            log.error("[diag] 0 valid rows — the RAW sample above shows what the model returned; "
+                      "fix the prompt/schema before spending more tokens.")
     return out
 
 

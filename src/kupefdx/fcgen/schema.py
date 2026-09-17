@@ -48,7 +48,55 @@ class SchemaError(ValueError):
     pass
 
 
+# flag aliases the LLM might emit ("BC", "eos", "backchannel", ...) -> canonical token
+_FLAG_CANON = {
+    "bc": FC_BACKCHANNEL, "backchannel": FC_BACKCHANNEL,
+    "think": FC_THINK, "thinking": FC_THINK,
+    "eos": FC_EOS_SPEECH, "eos_speech": FC_EOS_SPEECH, "eosspeech": FC_EOS_SPEECH,
+    "end_of_speech": FC_EOS_SPEECH,
+    "silence": FC_SILENCE,
+}
+
+
+def _canon_flag(flag):
+    if flag in (None, "", "none", "null", "nop", "<NOP>"):
+        return None
+    if flag in FLAGS:
+        return flag
+    key = str(flag).strip().strip("<>").lower()
+    return _FLAG_CANON.get(key)          # None if unrecognizable -> treated as no-flag
+
+
+def _coerce_seg(seg):
+    """Make one timeline segment schema-shaped, tolerating LLM drift (missing `kind`,
+    aliased flags, flag accidentally on a text segment). Returns None if unusable."""
+    if not isinstance(seg, dict):
+        return None
+    seg = dict(seg)
+    seg["flag"] = _canon_flag(seg.get("flag"))
+    text = (seg.get("text") or "").strip()
+    kind = seg.get("kind")
+    if kind not in ("speech", "pause"):          # infer when missing/other
+        if seg["flag"] or seg.get("surface") or ("dur_s" in seg) or ("dur" in seg):
+            kind = "pause"
+        elif text:
+            kind = "speech"
+        else:
+            return None
+    if kind == "speech" and seg["flag"]:         # a flag belongs to a pause, not speech
+        seg["flag"] = None                       #   keep the words, drop the stray flag
+    seg["kind"] = kind
+    if seg["flag"] is None:
+        seg.pop("flag", None)
+    return seg
+
+
 def validate_row(row: dict, *, fix: bool = True) -> dict:
+    if not isinstance(row, dict):
+        raise SchemaError("row is not an object")
+    row.setdefault("lang", "en")
+    if fix and isinstance(row.get("timeline"), list):
+        row["timeline"] = [s for s in (_coerce_seg(x) for x in row["timeline"]) if s]
     for k in REQUIRED:
         if k not in row:
             raise SchemaError(f"missing key: {k}")
