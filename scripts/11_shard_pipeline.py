@@ -46,6 +46,23 @@ SENTINEL = object()
 LED_LOCK = threading.Lock()   # serialize ledger writes across parallel download workers
 
 
+def _shard_stream(ds, wn, widx):
+    """Give worker `widx` its disjoint slice of a streaming dataset, across datasets versions.
+
+    - datasets 2.x: split_dataset_by_node (file-level split when file count % wn == 0).
+    - datasets 3.x: IterableDataset.shard.
+    - last resort: strided islice (parallel, but each worker reads all bytes).
+    """
+    try:
+        from datasets.distributed import split_dataset_by_node
+        return split_dataset_by_node(ds, rank=widx, world_size=wn)
+    except Exception:
+        pass
+    if hasattr(ds, "shard"):
+        return ds.shard(num_shards=wn, index=widx)
+    return itertools.islice(ds, widx, None, wn)
+
+
 def _split_of(cid, val=0.02, test=0.02):
     h = int(hashlib.sha1(cid.encode()).hexdigest(), 16) % 10000 / 10000.0
     return SPLIT_TEST if h < test else SPLIT_VAL if h < test + val else SPLIT_TRAIN
@@ -222,7 +239,7 @@ def download_worker(a, cfg, src_name, led, dl_q: Queue, dl_bar: tqdm, err_box: l
         except TypeError:
             ds = load_dataset(ds_id, cfg_name, split=split, streaming=True)
         if wn > 1:                       # disjoint file-shard for this worker
-            ds = ds.shard(num_shards=wn, index=widx)
+            ds = _shard_stream(ds, wn, widx)
 
         # Jump past done prefix using stored end_j when available.
         # Hub-synced shards often lack end_j — use shard_size * n as a safe lower bound
