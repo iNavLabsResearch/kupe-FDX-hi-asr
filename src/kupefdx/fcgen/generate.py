@@ -14,7 +14,7 @@ and emits deterministic, schema-valid rows for offline smoke tests.
 Configure the provider via env (see .env):
     KUPE_LLM_BASE_URL   e.g. https://cloud.olakrutrim.com/v1
     KUPE_LLM_API_KEY    provider key
-    KUPE_LLM_MODEL      e.g. gemma-4-31b-it
+    KUPE_LLM_MODEL      e.g. GLM-5.3-Flash (Krutrim), gemma-4-31b-it, gpt-oss-120b
     KUPE_LLM_MAX_OUT    max output tokens per hit   (default 8000)
     KUPE_LLM_TEMP       sampling temperature        (default 0.8)
     KUPE_LLM_STREAM     1=stream (default), 0=off
@@ -86,7 +86,7 @@ def _cfg() -> dict:
     return {
         "base_url": os.environ.get("KUPE_LLM_BASE_URL", "https://cloud.olakrutrim.com/v1"),
         "api_key": os.environ.get("KUPE_LLM_API_KEY", ""),
-        "model": os.environ.get("KUPE_LLM_MODEL", "gemma-4-31b-it"),
+        "model": os.environ.get("KUPE_LLM_MODEL", "GLM-5.3-Flash"),
     }
 
 

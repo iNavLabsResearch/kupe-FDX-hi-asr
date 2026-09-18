@@ -2,7 +2,7 @@
 """Generate ALL LLM training data in ONE command — floor-control (FC) + domain-correction.
 
 Reads a source ASR manifest (audio + transcript), probes each clip for pause/timing, and
-drives the LLM (Krutrim gemma-4-31b-it by default) to emit:
+drives the LLM (Krutrim GLM-5.3-Flash by default) to emit:
   * data/manifests/fc.jsonl      floor-control rows (audio-grounded flags/scenarios)
   * data/manifests/domain.jsonl  domain-correction rows (raw -> corrected transcript)
 
@@ -126,12 +126,14 @@ def probe_clips(rows, limit, cache_path, cfg=None, fetch=True):
     return clips
 
 
-def hub_syncer(cfg, path, no_push, mock, label):
-    """Return a sync_cb(done, total) that uploads `path` to the data repo, or None."""
+def hub_syncer(cfg, path, no_push, mock, label, hub_dir):
+    """Return a sync_cb(done, total) that uploads `path` to the data repo, or None.
+    New runs land under `hub_dir` (default manifests/latest); the previous run stays
+    archived under manifests/older."""
     if no_push or mock:
         return None
     from kupefdx.env import ensure_repo, hf_login, upload_file
-    dest = f"manifests/{os.path.basename(path)}"
+    dest = f"{hub_dir.rstrip('/')}/{os.path.basename(path)}"
     ready = {"ok": False}
 
     def sync(done, total):
@@ -159,7 +161,7 @@ def run_fc(cfg, clips, a):
 
     generate_fc(clips, rows_per_hit=a.rows_per_hit, clips_per_hit=a.clips_per_hit,
                 concurrency=a.concurrency, mock=a.mock, seen_ledger=led, push_cb=push,
-                sync_cb=hub_syncer(cfg, a.fc_out, a.no_push, a.mock, "fc"),
+                sync_cb=hub_syncer(cfg, a.fc_out, a.no_push, a.mock, "fc", a.hub_dir),
                 sync_every=a.sync_every, show_stream=a.show_stream)
     rows = rebalance(existing)
     for i, r in enumerate(rows):
@@ -178,7 +180,7 @@ def run_domain(cfg, clips, a):
 
     generate_domain(clips, clips_per_hit=a.clips_per_hit + 1, concurrency=a.concurrency,
                     mock=a.mock, seen_ledger=led, push_cb=push,
-                    sync_cb=hub_syncer(cfg, a.domain_out, a.no_push, a.mock, "domain"),
+                    sync_cb=hub_syncer(cfg, a.domain_out, a.no_push, a.mock, "domain", a.hub_dir),
                     sync_every=a.sync_every, show_stream=a.show_stream)
     for i, r in enumerate(existing):
         r["split"] = "train" if i < int(0.9 * len(existing)) else "val"
@@ -205,6 +207,8 @@ def main():
     ap.add_argument("--show-stream", action="store_true",
                     help="print the live SSE token stream (runs one call at a time)")
     ap.add_argument("--no-push", action="store_true", help="never sync to the Hub")
+    ap.add_argument("--hub-dir", default="manifests/latest",
+                    help="Hub folder for new manifests (older runs stay in manifests/older)")
     ap.add_argument("--no-fetch-audio", dest="fetch_audio", action="store_false",
                     help="do NOT auto-download missing raw wavs from the Hub (use duration-only)")
     # FC needs CONVERSATIONAL clips; lecture monologues teach bad turn-taking.
