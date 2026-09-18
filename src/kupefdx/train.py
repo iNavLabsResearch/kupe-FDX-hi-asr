@@ -262,13 +262,15 @@ def train(cfg, phase: int, resume: str | None = None, init_from: str | None = No
                 log.info("projector warmup done at step %d — Nandi unfrozen", step)
 
             if step % log_steps == 0:
-                parts = " ".join(f"{k}={float(v):.3f}" for k, v in out.items() if k != "loss")
+                scalars = {k: float(v.detach() if hasattr(v, "detach") else v)
+                           for k, v in out.items()}
+                parts = " ".join(f"{k}={scalars[k]:.3f}" for k in out if k != "loss")
                 log.info("step %d/%d | loss=%.4f %s | lr=%.2e | %.1fs",
-                         step, total_steps, float(out["loss"]), parts,
+                         step, total_steps, scalars["loss"], parts,
                          sched.get_last_lr()[0], time.time() - t0)
                 if wb:
-                    wb.log({"train/loss": float(out["loss"]),
-                            **{f"train/{k}": float(v) for k, v in out.items() if k != "loss"},
+                    wb.log({"train/loss": scalars["loss"],
+                            **{f"train/{k}": scalars[k] for k in out if k != "loss"},
                             "lr": sched.get_last_lr()[0]}, step=step)
             if eval_steps and step % eval_steps == 0:
                 _do_eval(model, va_rows, coll, cfg, step, wb, mode)
