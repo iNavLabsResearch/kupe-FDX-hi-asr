@@ -157,7 +157,9 @@ def train(cfg, phase: int, resume: str | None = None, init_from: str | None = No
     _seed(int(cfg.seed))
     dev = device_auto()
     ps = phase_setup(phase, cfg)
-    mode = "feats" if int(phase) == PHASE_ALIGN and bool(getattr(cfg.data, "use_cached_feats", False)) else "raw"
+    # frozen-encoder phases (all but JOINT) train on cached feats; only JOINT unfreezes the
+    # encoder and therefore needs raw audio.
+    mode = "feats" if int(phase) != PHASE_JOINT and bool(getattr(cfg.data, "use_cached_feats", False)) else "raw"
 
     run_name = resume if (resume and resume != "auto") else \
         f"{cfg.project}-p{phase}-{time.strftime('%Y%m%d-%H%M%S')}"
