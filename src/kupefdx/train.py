@@ -153,7 +153,7 @@ def _latest_ckpt(out_dir):
     return max(cks, key=lambda c: int(c.rsplit("-", 1)[-1]))
 
 
-def train(cfg, phase: int, resume: str | None = None) -> str:
+def train(cfg, phase: int, resume: str | None = None, init_from: str | None = None) -> str:
     _seed(int(cfg.seed))
     dev = device_auto()
     ps = phase_setup(phase, cfg)
@@ -165,6 +165,18 @@ def train(cfg, phase: int, resume: str | None = None) -> str:
     os.makedirs(out_dir, exist_ok=True)
 
     model = KupeFDXModel.build(cfg).to(dev)
+    # phase chaining: warm-start weights ONLY from a prior phase's run (fresh optimizer/step),
+    # so e.g. phase 4/5 inherit phase 2's aligned projector+Nandi. --resume is for continuing
+    # the SAME run; --init-from is for starting a NEW phase from a finished one.
+    if init_from and not resume:
+        src = init_from if (os.path.isdir(init_from) and os.path.exists(os.path.join(init_from, "state.pt"))) \
+            else _latest_ckpt(os.path.join(cfg.paths.runs_dir, init_from)) or _latest_ckpt(init_from)
+        if not src:
+            raise SystemExit(f"--init-from: no checkpoint found for '{init_from}'")
+        sd = torch.load(os.path.join(src, "state.pt"), map_location=dev, weights_only=False)
+        missing, unexpected = model.load_state_dict(sd["model"], strict=False)
+        log.info("init-from %s: loaded weights (fresh optimizer) | missing=%d unexpected=%d",
+                 src, len(missing), len(unexpected))
     model.stage(encoder=ps["enc"], ctc=ps["c"], projector=ps["proj"], decoder=ps["dec"],
                 fc=ps["fch"])
     from .constants import STAGE_NAME, STAGE_OF_PHASE
