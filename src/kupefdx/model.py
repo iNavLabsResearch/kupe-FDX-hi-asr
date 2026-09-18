@@ -70,7 +70,11 @@ class KupeFDXModel(nn.Module):
         specials = build_special_tokens(n_codes)
         special_ids = extend_vocab(decoder, tok, specials)
 
-        hidden = int(decoder.config.hidden_size)
+        # the projector + audio_bos/eos must live in Nandi's INPUT-embedding space, which for a
+        # factorized decoder (Nandi: 196) is smaller than hidden_size (832). Match the actual
+        # input-embedding dim so audio soft-prompts concat with token embeds. (Tiny: == hidden.)
+        _emb = decoder.get_input_embeddings()
+        hidden = int(getattr(_emb, "embedding_dim", 0) or decoder.config.hidden_size)
         enc_dim = int(encoder.out_dim)
         frontend = FeatureFrontend(enc_dim, hidden,
                                    getattr(cfg.audio, "projector", "mlp"),
