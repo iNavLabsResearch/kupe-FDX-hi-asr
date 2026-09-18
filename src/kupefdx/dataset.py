@@ -24,7 +24,12 @@ class ManifestDataset(Dataset):
                  max_dur: float = 30.0, split: str | None = None):
         if split:
             rows = [r for r in rows if r.get("split", SPLIT_TRAIN) == split]
-        self.rows = [r for r in rows if float(r.get("dur", 1.0)) <= max_dur]
+        rows = [r for r in rows if float(r.get("dur", 1.0)) <= max_dur]
+        # feats mode never reads raw audio: drop rows lacking a cached-feats path so nothing
+        # falls back to load_wav (which crashes on a feats-only box).
+        if mode == "feats":
+            rows = [r for r in rows if r.get("feats")]
+        self.rows = rows
         self.mode = mode
 
     def __len__(self):

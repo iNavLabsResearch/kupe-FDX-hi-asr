@@ -67,6 +67,14 @@ def _loaders(cfg, model, mode):
     max_dur = float(getattr(cfg.data, "max_dur", 30.0))
     tr = ManifestDataset(rows, mode, max_dur, SPLIT_TRAIN)
     va = ManifestDataset(rows, mode, max_dur, SPLIT_VAL)
+    if len(tr) == 0:
+        raise SystemExit(
+            f"0 trainable rows for mode='{mode}' in {cfg.data.manifest}.\n"
+            + ("  feats mode needs rows with a cached-feats path. fc.jsonl/domain.jsonl carry "
+               "raw-audio refs, not encoder feats — encode them first, or run this phase in raw "
+               "mode on a box WITH the wavs (set data.use_cached_feats=false)."
+               if mode == "feats" else
+               "  raw mode needs local wavs — none found. pull raw audio or use feats mode."))
     coll = Collator(model.tok, model.char_tok, bos_id=model.bos_id, eos_id=model.eos_id,
                     pad_id=model.pad_id, special_ids=model.special_ids,
                     max_audio_frames=int(cfg.model.max_audio_frames),
