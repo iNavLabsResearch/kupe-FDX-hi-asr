@@ -73,8 +73,8 @@ def check_data(cfg, manifest: str, sample: int = 300, expect_dim: int = 512):
         cache = {}
         for r in pick:
             p = r["feats"]
-            if not os.path.isabs(p):
-                p = os.path.join(cfg.paths.data_dir, "encoded", p)
+            if not os.path.isabs(p) and not os.path.isfile(p):
+                p = os.path.join(cfg.paths.data_dir, "encoded", p)   # legacy relative feats path
             if not os.path.isfile(p):
                 miss += 1; continue
             try:
